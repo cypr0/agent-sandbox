@@ -1,0 +1,33 @@
+# Initial Hermes configuration for the sandbox. Copied to $HERMES_HOME/config.yaml
+# on first start; afterwards it belongs to Hermes ("hermes model" and
+# "hermes config set" write into it). Re-seed with SEED_OVERWRITE=1.
+#
+# Model/provider preferably come from the sandbox .env
+# (HERMES_PROVIDER, HERMES_MODEL, HERMES_BASE_URL) or from "hermes model".
+
+model:
+  provider: openrouter
+  default: ""            # set via HERMES_MODEL in .env or "hermes model"
+
+agent:
+  max_turns: 120         # implementation + pipeline needs more turns than a chat
+
+display:
+  tool_progress: all
+
+compression:
+  enabled: true
+  threshold: 0.5
+
+skills:
+  # Shared skills with Claude Code. Hermes' skill discovery reads this file
+  # (not the managed policy), so the entrypoint enforces this entry on every start.
+  external_dirs:
+    - /opt/sandbox/config/skills
+
+security:
+  tirith_enabled: true
+  tirith_fail_open: false
+  # Set to true for web development (browser tool on http://localhost:3000).
+  # Note: this also allows requests into your home network.
+  allow_private_urls: false

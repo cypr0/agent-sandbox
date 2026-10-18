@@ -1,0 +1,37 @@
+# Server-side counterpart of the local devsecops-gate for GitLab merge requests.
+# Include it from .gitlab-ci.yml:
+#
+#   include:
+#     - local: .gitlab/ci/devsecops.gitlab-ci.yml
+#
+# Images are pinned to versions - Renovate keeps them up to date.
+
+stages: [devsecops]
+
+.devsecops:
+  stage: devsecops
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+secrets:gitleaks:
+  extends: .devsecops
+  image:
+    name: ghcr.io/gitleaks/gitleaks:v8.30.1
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - git fetch --quiet origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - gitleaks git --no-banner --redact --log-opts="origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}..HEAD" .
+
+iac:trivy:
+  # Report only: on the whole repo legacy findings would block every MR.
+  # Blocking and diff-aware checks happen in devsecops-gate in the sandbox.
+  extends: .devsecops
+  image:
+    name: aquasec/trivy:0.76.0
+    entrypoint: [""]
+  script:
+    - trivy config --exit-code 0 --severity HIGH,CRITICAL --skip-dirs .git .
+  allow_failure: true

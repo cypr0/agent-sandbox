@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Shim in front of /usr/local/bin/glab: checks subcommand and flags against the sandbox policy.
+# Free-text values (title, description, notes, fields) are removed before the check,
+# so an MR description that mentions e.g. "merge" is not blocked by mistake.
+args=()
+skip=0
+for a in "$@"; do
+  if [ $skip -eq 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -t|--title|-d|--description|-m|--message|-f|--field|--raw-field|--body|-n|--notes|--search) skip=1 ;;
+    --title=*|--description=*|--message=*|--field=*|--raw-field=*|--body=*|--notes=*|--search=*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+sandbox-guard --check "glab ${args[*]}" "$PWD" || exit 2
+exec /usr/local/bin/glab "$@"

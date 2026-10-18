@@ -1,0 +1,7 @@
+# Dev sandbox: apt packages follow the Debian release (security updates on rebuild),
+# tool versions that matter are pinned as ARGs in the Dockerfile.
+ignored:
+  - DL3008   # pin apt package versions
+  - DL3003   # cd inside RUN for short download steps
+  - DL3066   # USER dev is resolved inside the image
+  - SC2012   # ls -d with a known glob in /opt/hermes/tools

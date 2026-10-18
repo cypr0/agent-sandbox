@@ -1,0 +1,28 @@
+# For repos with label sync (.github/labels.yaml + EndBug/label-sync, delete-other-labels: true),
+# e.g. repos based on the onedr0p cluster-template: append this block to .github/labels.yaml, otherwise the next sync
+# deletes the labels again.
+# Agent workflow
+- name: agent/todo
+  color: "c5def5"
+  description: "New work item - not planned yet"
+- name: agent/planned
+  color: "fbca04"
+  description: "Plan posted on the issue - waiting for approval"
+- name: agent/approved
+  color: "0e8a16"
+  description: "Plan approved - may be implemented"
+- name: agent/in-progress
+  color: "1d76db"
+  description: "An agent is working on it"
+- name: agent/in-review
+  color: "5319e7"
+  description: "Pull request open - waiting for human review"
+- name: agent/blocked
+  color: "d93f0b"
+  description: "Question/problem - a human has to respond"
+- name: agent/claude
+  color: "cccccc"
+  description: "Preferred agent: Claude Code"
+- name: agent/hermes
+  color: "cccccc"
+  description: "Preferred agent: Hermes"

@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# ticket - work items for the agents on GitHub (gh) and GitLab (glab) - one interface for both.
+# Runs inside the sandbox and - with gh/glab/jq installed - directly on the host.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+ticket - work items for Claude/Hermes as GitHub or GitLab issues
+
+For humans
+  ticket new  [-R repo] [-a claude|hermes] [-k label] "Title"   create work item (editor or stdin;
+                                                                 German input is translated to English)
+  ticket ls   [-R repo] [state]                                  work items by state
+  ticket queue                                                   approved work items in $TICKET_REPOS
+  ticket show    <ref>                                           issue with comments
+  ticket approve <ref> [note]                                    approve plan (-> agent/approved)
+  ticket reject  <ref> "reason"                                  reject plan (-> agent/todo)
+  ticket block   <ref> "reason"                                  block (-> agent/blocked)
+  ticket run <plan|implement|review> <ref> [--agent claude|hermes] [--auto]
+  ticket run docs <repo|ref> [--path <app-dir>] [--only readme,license,...]   documentation (/write-docs)
+  ticket labels  [-R repo]                                       create state labels
+  ticket clean                                                   remove worktrees of merged agent/* branches
+
+For agents/skills (forge-neutral)
+  ticket info    <ref>                     FORGE, REPO, NR, URL, DIR, DEFAULT_BRANCH, CLI (KEY=VALUE)
+  ticket clone   <ref>                     clone/update repo in /workspace/<name>, print path
+  ticket state   <ref> <state>             set state label (todo|planned|approved|in-progress|in-review|blocked)
+  ticket comment <ref> <file|->            comment on an issue
+  ticket upsert-comment <ref> <marker> <file>    create or update the comment containing <marker> (plan)
+  ticket pr <ref> --branch <b> --title <t> --body-file <f> [--draft]   open PR/MR against the default branch
+  ticket pr-comment <pr-ref> <file>        review comment on a PR/MR (never an approval)
+
+Repos and references
+  GitHub:  owner/repo           owner/repo#12   https://github.com/owner/repo/issues/12  (.../pull/12)
+  GitLab:  gitlab.com/grp/proj  gitlab.com/grp/proj#12   gitlab.com/grp/proj!7 (MR)
+           https://<host>/grp/sub/proj/-/issues/12      (.../-/merge_requests/7)
+  number only: repo of the current directory, otherwise $TICKET_DEFAULT_REPO
+
+State model (labels, identical on both forges):
+  agent/todo -> agent/planned -> agent/approved -> agent/in-progress -> agent/in-review -> (merged)
+                       \-> agent/blocked                 routing: agent/claude, agent/hermes
+EOF
+}
+
+die() { echo "ticket: $*" >&2; exit 1; }
+GH="${GH_BIN:-gh}"
+GLAB="${GLAB_BIN:-glab}"
+GL_DEFAULT_HOST="${GITLAB_HOST:-gitlab.com}"; GL_DEFAULT_HOST="${GL_DEFAULT_HOST#https://}"; GL_DEFAULT_HOST="${GL_DEFAULT_HOST%/}"
+
+LABELS=(
+  "agent/todo|c5def5|New work item - not planned yet"
+  "agent/planned|fbca04|Plan posted on the issue - waiting for approval"
+  "agent/approved|0e8a16|Plan approved - may be implemented"
+  "agent/in-progress|1d76db|An agent is working on it"
+  "agent/in-review|5319e7|Pull/merge request open - waiting for human review"
+  "agent/blocked|d93f0b|Question/problem - a human has to respond"
+  "agent/claude|cccccc|Preferred agent: Claude Code"
+  "agent/hermes|cccccc|Preferred agent: Hermes"
+)
+STATES="todo planned approved in-progress in-review blocked"
+
+# ================================================================ repo/reference resolution
+# Result in global variables: FORGE (github|gitlab) HOST REPO NR KIND (issue|pr)
+
+# set_repo <repo-spec>
+set_repo() {
+  local s="$1"
+  s="${s#https://}"; s="${s#http://}"; s="${s%.git}"; s="${s%/}"
+  case "$s" in
+    gl:*) FORGE=gitlab; HOST="$GL_DEFAULT_HOST"; REPO="${s#gl:}" ;;
+    github.com/*) FORGE=github; HOST=github.com; REPO="${s#github.com/}" ;;
+    *.*/*/*) FORGE=gitlab; HOST="${s%%/*}"; REPO="${s#*/}" ;;   # host/group/[sub/]project
+    */*) FORGE=github; HOST=github.com; REPO="$s" ;;
+    *) die "unknown repo: $1" ;;
+  esac
+}
+
+repo_of_cwd() {
+  local url host path
+  url="$(git remote get-url origin 2>/dev/null)" || return 0
+  case "$url" in
+    git@*) host="${url#git@}"; host="${host%%:*}"; path="${url#*:}" ;;
+    http*://*) host="${url#*://}"; host="${host#*@}"; path="${host#*/}"; host="${host%%/*}" ;;
+    *) return 0 ;;
+  esac
+  path="${path%.git}"
+  if [ "$host" = github.com ]; then echo "$path"; else echo "$host/$path"; fi
+}
+
+resolve_repo() {
+  local r="${1:-}"
+  [ -n "$r" ] || r="$(repo_of_cwd)"
+  [ -n "$r" ] || r="${TICKET_DEFAULT_REPO:-}"
+  [ -n "$r" ] || die "no repo - pass -R <repo> or set TICKET_DEFAULT_REPO"
+  set_repo "$r"
+}
+
+# ref <referenz> [repo]
+ref() {
+  local r="$1" s
+  KIND=issue
+  s="${r#https://}"; s="${s#http://}"
+  if [[ "$s" =~ ^github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+) ]]; then
+    set_repo "${BASH_REMATCH[1]}"; NR="${BASH_REMATCH[3]}"; [ "${BASH_REMATCH[2]}" = pull ] && KIND="pr"
+  elif [[ "$s" =~ ^([^/]+\.[^/]+)/(.+)/-/(issues|merge_requests)/([0-9]+) ]]; then
+    FORGE=gitlab; HOST="${BASH_REMATCH[1]}"; REPO="${BASH_REMATCH[2]}"; NR="${BASH_REMATCH[4]}"
+    [ "${BASH_REMATCH[3]}" = merge_requests ] && KIND="pr"
+  elif [[ "$r" =~ ^(.+/.+)([#!])([0-9]+)$ ]]; then
+    set_repo "${BASH_REMATCH[1]}"; NR="${BASH_REMATCH[3]}"; [ "${BASH_REMATCH[2]}" = "!" ] && KIND="pr"
+  elif [[ "$r" =~ ^([#!]?)([0-9]+)$ ]]; then
+    resolve_repo "${2:-}"; NR="${BASH_REMATCH[2]}"; [ "${BASH_REMATCH[1]}" = "!" ] && KIND="pr"
+  else
+    die "unknown reference: $r (number, repo#nr, repo!nr or URL)"
+  fi
+  return 0
+}
+
+gl_url() { echo "https://$HOST/$REPO"; }
+gl_id()  { jq -rn --arg p "$REPO" '$p|@uri'; }
+gl_api() { $GLAB api --hostname "$HOST" "$@"; }
+web_url() {
+  if [ "$FORGE" = github ]; then
+    if [ "$KIND" = pr ]; then echo "https://github.com/$REPO/pull/$NR"; else echo "https://github.com/$REPO/issues/$NR"; fi
+  else
+    if [ "$KIND" = pr ]; then echo "https://$HOST/$REPO/-/merge_requests/$NR"; else echo "https://$HOST/$REPO/-/issues/$NR"; fi
+  fi
+}
+repo_dir() { echo "/workspace/${REPO##*/}"; }
+default_branch() {
+  if [ "$FORGE" = github ]; then $GH repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name
+  else gl_api "projects/$(gl_id)" | jq -r .default_branch; fi
+}
+spec() { if [ "$FORGE" = github ]; then echo "$REPO"; else echo "$HOST/$REPO"; fi; }
+sep()  { if [ "$KIND" = pr ] && [ "$FORGE" = gitlab ]; then echo "!"; else echo "#"; fi; }
+
+# ================================================================ forge operations
+f_labels_of() {
+  if [ "$FORGE" = github ]; then $GH issue view "$NR" -R "$REPO" --json labels -q '.labels[].name'
+  else gl_api "projects/$(gl_id)/$( [ "$KIND" = pr ] && echo merge_requests || echo issues )/$NR" | jq -r '.labels[]'; fi
+}
+f_comment() { # f_comment <file>
+  if [ "$FORGE" = github ]; then $GH issue comment "$NR" -R "$REPO" --body-file "$1" >/dev/null
+  else gl_api -X POST "projects/$(gl_id)/$( [ "$KIND" = pr ] && echo merge_requests || echo issues )/$NR/notes" -f "body=$(cat "$1")" >/dev/null; fi
+}
+f_set_state() { # f_set_state <state>
+  local new="$1" s rm=()
+  for s in $STATES; do [ "$s" = "$new" ] || rm+=("agent/$s"); done
+  if [ "$FORGE" = github ]; then
+    local args=(); for s in "${rm[@]}"; do args+=(--remove-label "$s"); done
+    $GH issue edit "$NR" -R "$REPO" --add-label "agent/$new" "${args[@]}" >/dev/null
+  else
+    local IFS=,
+    gl_api -X PUT "projects/$(gl_id)/issues/$NR" -f "add_labels=agent/$new" -f "remove_labels=${rm[*]}" >/dev/null
+  fi
+}
+f_show() {
+  if [ "$FORGE" = github ]; then
+    if [ "$KIND" = pr ]; then $GH pr view "$NR" -R "$REPO" --comments; else $GH issue view "$NR" -R "$REPO" --comments; fi
+  else
+    if [ "$KIND" = pr ]; then $GLAB mr view "$NR" -R "$(gl_url)" --comments; else $GLAB issue view "$NR" -R "$(gl_url)" --comments; fi
+  fi
+}
+
+# ================================================================ translation (everything on the forge is English)
+# The human may write German; issues and comments are stored in English. Uses Claude Code
+# (claude -p) when it is logged in; otherwise the text is kept and /plan-item translates it later.
+# TICKET_TRANSLATE=0 disables it.
+_run_timeout() { if command -v timeout >/dev/null; then timeout "$@"; else shift; "$@"; fi; }
+_translator_ok() { [ "${TICKET_TRANSLATE:-1}" != 0 ] && command -v claude >/dev/null 2>&1; }
+
+translate_line() { # translate_line <text> -> English text (or the input on failure)
+  local out
+  if _translator_ok && out="$(printf '%s' "$1" | _run_timeout 90 claude -p \
+      "Translate the text from stdin into concise, natural English. If it is already English, return it unchanged. Output only the translation." \
+      --output-format text 2>/dev/null)" && [ -n "$out" ]; then
+    printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+translate_ticket() { # translate_ticket <body-file>; rewrites $title and the body file
+  local f="$1" out t
+  _translator_ok || { echo "ticket: no translator available - /plan-item will translate the issue into English." >&2; return 0; }
+  echo "ticket: translating to English (claude -p) ..." >&2
+  if ! out="$( { printf '%s\n---\n' "$title"; cat "$f"; } | _run_timeout 180 claude -p \
+      "Translate this issue (first line = title, then a line '---', then the Markdown body) into clear, natural English for a GitHub/GitLab ticket. Keep the Markdown structure, checkboxes, headings, code, commands, paths, identifiers and URLs unchanged; drop HTML comments that only contain template hints. If it is already English, return it unchanged. Output exactly: the title on the first line, a line containing only ---, then the body. No other text." \
+      --output-format text 2>/dev/null)" || [ -z "$out" ]; then
+    echo "ticket: translation failed - creating as entered; /plan-item will translate it." >&2; return 0
+  fi
+  t="$(printf '%s\n' "$out" | sed -n '1p')"
+  if [ -z "$t" ] || [ "$(printf '%s\n' "$out" | sed -n '2p')" != "---" ]; then
+    echo "ticket: unexpected translator output - creating as entered." >&2; return 0
+  fi
+  title="$t"; printf '%s\n' "$out" | sed '1,2d' >"$f"
+  if [ -t 1 ] && [ -r /dev/tty ]; then
+    printf '\n\033[1m%s\033[0m\n\n' "$title"; cat "$f"; printf '\nCreate this issue? [Y/n] '
+    local a; read -r a </dev/tty || a=y; case "$a" in n|N|no|nein) die "aborted";; esac
+  fi
+}
+
+# ================================================================ commands for humans
+cmd_labels() {
+  local l name color desc
+  resolve_repo "${1:-}"
+  for l in "${LABELS[@]}"; do
+    IFS='|' read -r name color desc <<<"$l"
+    if [ "$FORGE" = github ]; then
+      $GH label create "$name" -R "$REPO" --color "$color" --description "$desc" --force >/dev/null
+    else
+      gl_api -X POST "projects/$(gl_id)/labels" -f "name=$name" -f "color=#$color" -f "description=$desc" >/dev/null 2>&1 \
+        || gl_api -X PUT "projects/$(gl_id)/labels/$(jq -rn --arg n "$name" '$n|@uri')" -f "color=#$color" -f "description=$desc" >/dev/null
+    fi
+    echo "  label $name"
+  done
+  if [ "$FORGE" = github ] && $GH api "repos/$REPO/contents/.github/labels.yaml" >/dev/null 2>&1; then
+    echo "Note: $REPO syncs labels from .github/labels.yaml (label-sync)."
+    echo "      Add the agent/* labels there (templates/github/labels-snippet.yaml) or the next sync deletes them."
+  fi
+}
+
+cmd_new() {
+  local repo="" agent="" extra=() OPTIND=1 opt
+  while getopts "R:a:k:" opt; do
+    case $opt in R) repo="$OPTARG";; a) agent="$OPTARG";; k) extra+=("$OPTARG");; *) usage; exit 1;; esac
+  done
+  shift $((OPTIND - 1))
+  local title="${*:-}"; [ -n "$title" ] || die 'title missing: ticket new "What should happen"'
+  resolve_repo "$repo"
+  local body; body="$(mktemp)"
+  cat >"$body" <<'EOF'
+### Goal / user story
+As a ... I want ... so that ...
+
+### Acceptance criteria
+- [ ]
+- [ ]
+
+### Context & notes
+<!-- links, affected apps/paths, logs, examples in the repo (German is fine - it gets translated) -->
+
+### Boundaries
+<!-- what must NOT be touched? maintenance window? -->
+
+### Risk
+low
+EOF
+  if [ ! -t 0 ]; then cat >"$body"; else "${EDITOR:-nano}" "$body"; fi
+  translate_ticket "$body"
+  local labels=(agent/todo); [ -n "$agent" ] && labels+=("agent/$agent")
+  labels+=("${extra[@]+"${extra[@]}"}")
+  if [ "$FORGE" = github ]; then
+    local args=(); for l in "${labels[@]}"; do args+=(--label "$l"); done
+    $GH issue create -R "$REPO" --title "$title" --body-file "$body" "${args[@]}"
+  else
+    local IFS=,
+    gl_api -X POST "projects/$(gl_id)/issues" -f "title=$title" -f "description=$(cat "$body")" -f "labels=${labels[*]}" | jq -r .web_url
+  fi
+  rm -f "$body"
+}
+
+cmd_ls() {
+  local repo="" OPTIND=1 opt s out
+  while getopts "R:" opt; do case $opt in R) repo="$OPTARG";; *) exit 1;; esac; done
+  shift $((OPTIND - 1))
+  resolve_repo "$repo"
+  for s in ${1:-$STATES}; do
+    if [ "$FORGE" = github ]; then
+      out="$($GH issue list -R "$REPO" --label "agent/$s" --state open --limit 50 --json number,title,labels,updatedAt \
+        -q '.[] | "  #\(.number)\t\(.title)\t[\([.labels[].name | select(test("^agent/(claude|hermes)$"))] | join(","))]\t\(.updatedAt[0:10])"')"
+    else
+      out="$(gl_api "projects/$(gl_id)/issues?state=opened&per_page=50&labels=$(jq -rn --arg l "agent/$s" '$l|@uri')" \
+        | jq -r '.[] | "  #\(.iid)\t\(.title)\t[\([.labels[] | select(test("^agent/(claude|hermes)$"))] | join(","))]\t\(.updated_at[0:10])"')"
+    fi
+    [ -n "$out" ] && { printf '\n\033[1m%s\033[0m (%s)\n' "agent/$s" "$(spec)"; echo "$out" | column -t -s $'\t'; }
+  done
+  echo
+}
+
+cmd_queue() {
+  local r
+  for r in ${TICKET_REPOS:-${TICKET_DEFAULT_REPO:-}}; do cmd_ls -R "$r" approved; done
+}
+
+cmd_approve() {
+  ref "$1"; shift
+  local f; f="$(mktemp)"; echo "✅ **Plan approved**${*:+ - $(translate_line "$*")}" >"$f"; f_comment "$f"; rm -f "$f"
+  f_set_state approved
+  echo "$(spec)#$NR approved. Start the implementation: ticket run implement $(spec)#$NR"
+}
+cmd_reject() {
+  ref "$1"; shift; [ $# -gt 0 ] || die "give a reason"
+  local f; f="$(mktemp)"; echo "↩️ **Plan rejected:** $(translate_line "$*")" >"$f"; f_comment "$f"; rm -f "$f"
+  f_set_state todo
+  echo "$(spec)#$NR back to agent/todo. Plan again: ticket run plan $(spec)#$NR"
+}
+cmd_block() {
+  ref "$1"; shift
+  local f; f="$(mktemp)"; echo "⛔ **Blocked:** $(translate_line "${*:-no reason given}")" >"$f"; f_comment "$f"; rm -f "$f"
+  f_set_state blocked
+}
+
+cmd_run() {
+  [ $# -ge 2 ] || die "ticket run <plan|implement|review|docs> <ref|repo> [--agent claude|hermes] [--auto] [--path <dir>] [--only <list>]"
+  local phase="$1" r="$2" agent="" auto=0 skill opts=""
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) agent="$2"; shift 2 ;;
+      --auto) auto=1; shift ;;
+      --path) opts="$opts $2"; shift 2 ;;
+      --only) opts="$opts --only $2"; shift 2 ;;
+      *) die "unknown: $1" ;;
+    esac
+  done
+  case "$phase" in plan) skill=plan-item;; implement) skill=implement-item;; review) skill=review-pr;; docs) skill=write-docs;;
+                   *) die "phase: plan|implement|review|docs";; esac
+  local target cur_labels=""
+  if [ "$phase" = docs ] && ! [[ "$r" =~ [#!][0-9]+$|/(issues|pull|merge_requests)/[0-9]+ ]]; then
+    resolve_repo "$r"; NR=""; KIND=issue; target="$(spec)"      # whole repo, no issue
+  else
+    ref "$r"; [ "$phase" = review ] && KIND="pr"
+    target="$(web_url)"
+    cur_labels="$(f_labels_of 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+  if [ -z "$agent" ]; then case " $cur_labels " in *" agent/hermes "*) agent=hermes;; *) agent=claude;; esac; fi
+  if [ "$phase" = implement ] && [ "$auto" -eq 1 ] && [[ " $cur_labels " != *" agent/approved "* ]]; then
+    die "$(spec)#$NR is not approved (agent/approved missing) - first: ticket approve $(spec)#$NR"
+  fi
+  local dir; dir="$(cmd_clone_quiet)"; [ -d "$dir" ] && cd "$dir"
+  local input="$target$opts"
+  echo "→ $agent: /$skill $input  (in $(pwd))"
+  case "$agent:$auto" in
+    claude:0) exec claude "/$skill $input" ;;
+    claude:1) exec claude -p "/$skill $input" --permission-mode bypassPermissions --output-format text ;;
+    hermes:0) exec hermes chat -s "$skill" -q "$input" ;;
+    hermes:1) exec hermes chat --oneshot -s "$skill" -q "$input" ;;
+    *) die "agent: claude|hermes" ;;
+  esac
+}
+
+cmd_clean() {
+  local root="${1:-/workspace}" r wt br main
+  for r in "$root"/*/.git; do
+    r="$(dirname "$r")"
+    git -C "$r" fetch -q --prune origin 2>/dev/null || continue
+    main="$(git -C "$r" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+    git -C "$r" worktree list --porcelain | awk '/^worktree /{w=$2} /^branch /{print w" "$2}' | while read -r wt br; do
+      br="${br#refs/heads/}"
+      [[ "$br" == agent/* ]] || continue
+      # merged (also squash: remote branch deleted) -> remove
+      if git -C "$r" merge-base --is-ancestor "$br" "$main" 2>/dev/null || ! git -C "$r" rev-parse -q --verify "origin/$br" >/dev/null; then
+        if [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+          git -C "$r" worktree remove "$wt" && git -C "$r" branch -D "$br" >/dev/null 2>&1 && echo "removed: $wt ($br)"
+        else
+          echo "skipped (uncommitted changes): $wt"
+        fi
+      fi
+    done
+  done
+}
+
+# ================================================================ commands for agents/skills
+cmd_info() {
+  ref "$1"
+  echo "FORGE=$FORGE"; echo "HOST=$HOST"; echo "REPO=$REPO"; echo "NR=$NR"; echo "KIND=$KIND"
+  echo "URL=$(web_url)"; echo "DIR=$(repo_dir)"; echo "DEFAULT_BRANCH=$(default_branch 2>/dev/null || echo main)"
+  echo "CLI=$( [ "$FORGE" = github ] && echo gh || echo glab )"
+}
+
+cmd_clone_quiet() {
+  local dir; dir="$(repo_dir)"
+  [ -d /workspace ] || { echo "$PWD"; return; }
+  if [ ! -d "$dir/.git" ]; then
+    if [ "$FORGE" = github ]; then $GH repo clone "$REPO" "$dir" -- -q >&2
+    else git clone -q "$(gl_url).git" "$dir" >&2; fi
+  else
+    git -C "$dir" fetch -q --prune origin >&2 || true
+  fi
+  echo "$dir"
+}
+cmd_clone() { ref "$1"; cmd_clone_quiet; }
+
+cmd_state() {
+  ref "$1"; local s="${2:-}"
+  [[ " $STATES " == *" $s "* ]] || die "state: $STATES"
+  f_set_state "$s"; echo "$(spec)#$NR -> agent/$s"
+}
+
+cmd_comment() {
+  ref "$1"; local f="${2:--}" tmp=""
+  if [ "$f" = - ]; then tmp="$(mktemp)"; cat >"$tmp"; f="$tmp"; fi
+  [ -f "$f" ] || die "file missing: $f"
+  f_comment "$f"; [ -n "$tmp" ] && rm -f "$tmp"
+  echo "commented on $(web_url)"
+}
+
+cmd_upsert_comment() {
+  ref "$1"; local marker="$2" f="$3" id
+  [ -f "$f" ] || die "file missing: $f"
+  grep -qF -- "$marker" "$f" || die "file does not contain the marker '$marker'"
+  if [ "$FORGE" = github ]; then
+    id="$($GH api "repos/$REPO/issues/$NR/comments" --paginate --jq ".[] | select(.body | contains(\"$marker\")) | .id" | tail -1)"
+    if [ -n "$id" ]; then $GH api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$f" >/dev/null; echo "updated: comment $id"
+    else $GH issue comment "$NR" -R "$REPO" --body-file "$f" >/dev/null; echo "created"; fi
+  else
+    local base; base="projects/$(gl_id)/issues/$NR/notes"
+    id="$(gl_api "$base?per_page=100&sort=asc" | jq -r --arg m "$marker" '.[] | select(.body | contains($m)) | .id' | tail -1)"
+    if [ -n "$id" ]; then gl_api -X PUT "$base/$id" -f "body=$(cat "$f")" >/dev/null; echo "updated: note $id"
+    else gl_api -X POST "$base" -f "body=$(cat "$f")" >/dev/null; echo "created"; fi
+  fi
+}
+
+cmd_pr() {
+  ref "$1"; shift
+  local branch="" title="" body="" draft=0 base
+  while [ $# -gt 0 ]; do
+    case "$1" in --branch) branch="$2"; shift 2;; --title) title="$2"; shift 2;; --body-file) body="$2"; shift 2;;
+                 --draft) draft=1; shift;; *) die "unknown: $1";; esac
+  done
+  [ -n "$branch" ] && [ -n "$title" ] && [ -f "$body" ] || die "ticket pr <ref> --branch <b> --title <t> --body-file <f> [--draft]"
+  [[ "$branch" =~ ^($(echo "main master ${PROTECTED_BRANCHES:-}" | xargs | tr ' ' '|'))$ ]] && die "source branch must not be a protected branch"
+  base="$(default_branch)"
+  if [ "$FORGE" = github ]; then
+    local args=(--base "$base" --head "$branch" --title "$title" --body-file "$body")
+    [ "$draft" -eq 1 ] && args+=(--draft)
+    $GH pr create -R "$REPO" "${args[@]}"
+  else
+    [ "$draft" -eq 1 ] && title="Draft: $title"
+    gl_api -X POST "projects/$(gl_id)/merge_requests" -f "source_branch=$branch" -f "target_branch=$base" \
+      -f "title=$title" -f "description=$(cat "$body")" -F "remove_source_branch=true" | jq -r .web_url
+  fi
+}
+
+cmd_pr_comment() {
+  ref "$1"; KIND="pr"; local f="$2"
+  [ -f "$f" ] || die "file missing: $f"
+  if [ "$FORGE" = github ]; then $GH pr review "$NR" -R "$REPO" --comment --body-file "$f" >/dev/null
+  else gl_api -X POST "projects/$(gl_id)/merge_requests/$NR/notes" -f "body=$(cat "$f")" >/dev/null; fi
+  echo "review comment on $(web_url)"
+}
+
+case "${1:-help}" in
+  new) shift; cmd_new "$@" ;;
+  ls|list) shift; cmd_ls "$@" ;;
+  queue) shift; cmd_queue ;;
+  show) shift; ref "$1"; f_show ;;
+  approve) shift; cmd_approve "$@" ;;
+  reject) shift; cmd_reject "$@" ;;
+  block) shift; cmd_block "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  labels) shift; [ "${1:-}" = "-R" ] && shift; cmd_labels "${1:-}" ;;
+  info) shift; cmd_info "$@" ;;
+  clone) shift; cmd_clone "$@" ;;
+  state) shift; cmd_state "$@" ;;
+  comment) shift; cmd_comment "$@" ;;
+  upsert-comment) shift; cmd_upsert_comment "$@" ;;
+  pr) shift; cmd_pr "$@" ;;
+  pr-comment) shift; cmd_pr_comment "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

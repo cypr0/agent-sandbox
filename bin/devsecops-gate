@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# devsecops-gate - deterministic quality and security checks.
+#
+# Only checks what changed compared to the base branch (diff-aware), so legacy
+# issues in the repo do not block every PR/MR. The same checks for Claude,
+# Hermes and humans - the LLM reviews build on this report.
+#
+#   devsecops-gate [--base <ref>] [--all] [--deep] [--no-tests] [--report <file>] [-q]
+#
+#   --base      comparison base (default: origin/HEAD, otherwise origin/main)
+#   --all       all tracked files instead of only changed ones
+#   --deep      additional expensive checks (flux-local test + diff, trivy vuln on the whole repo)
+#   --no-tests  do not run project tests
+#   --report    write the Markdown report here (default: <git-dir>/devsecops-report.md)
+#   -q          print only the table, no details
+#
+# Exit: 0 = passed (warnings possible), 1 = blocking findings, 3 = usage error
+#
+# Project-specific extra checks: an executable .sandbox/checks.sh in the repo
+# (exit 0 = ok, 1 = FAIL, 2 = WARN). It receives the changed files as arguments.
+set -uo pipefail
+
+BASE="" ALL=0 DEEP=0 TESTS=1 REPORT="" QUIET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) BASE="$2"; shift 2 ;;
+    --all) ALL=1; shift ;;
+    --deep) DEEP=1; shift ;;
+    --no-tests) TESTS=0; shift ;;
+    --report) REPORT="$2"; shift 2 ;;
+    -q) QUIET=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 3 ;;
+  esac
+done
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repository" >&2; exit 3; }
+cd "$ROOT" || exit 3
+GITDIR="$(git rev-parse --absolute-git-dir)"
+WORK="$GITDIR/devsecops"; rm -rf "$WORK"; mkdir -p "$WORK"
+REPORT="${REPORT:-$GITDIR/devsecops-report.md}"
+
+# ---------------------------------------------------------------- base + files
+if [ -z "$BASE" ]; then
+  BASE="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"
+  for b in "$BASE" origin/main origin/master main master; do
+    [ -n "$b" ] && git rev-parse -q --verify "$b^{commit}" >/dev/null && { BASE="$b"; break; }
+  done
+fi
+MB="$(git merge-base HEAD "$BASE" 2>/dev/null || git rev-parse HEAD 2>/dev/null || true)"
+
+if [ "$ALL" -eq 1 ] || [ -z "$MB" ]; then
+  mapfile -t FILES < <(git ls-files)
+else
+  mapfile -t FILES < <({ git diff --name-only --diff-filter=ACMR "$MB"; git ls-files --others --exclude-standard; } | sort -u)
+fi
+tmp=(); for f in "${FILES[@]}"; do [ -f "$f" ] && tmp+=("$f"); done; FILES=("${tmp[@]+"${tmp[@]}"}")
+printf '%s\n' "${FILES[@]+"${FILES[@]}"}" > "$WORK/changed.txt"
+
+# ---------------------------------------------------------------- result collection
+declare -a R_NAME R_STATUS R_SUM R_LOG
+add() { R_NAME+=("$1"); R_STATUS+=("$2"); R_SUM+=("$3"); R_LOG+=("${4:-}"); }
+have() { command -v "$1" >/dev/null 2>&1; }
+pick() { # pick <regex> -> changed files whose path matches
+  local f; for f in "${FILES[@]+"${FILES[@]}"}"; do [[ "$f" =~ $1 ]] && printf '%s\n' "$f"; done; }
+is_templated() { # Helm chart templates, Jinja etc.: template markers AND not parseable as YAML (or in a chart's templates/)
+  grep -qE '\{\{|\{%' "$1" 2>/dev/null || return 1
+  local d; d="$(dirname "$1")"
+  [ "$(basename "$d")" = templates ] && [ -f "$(dirname "$d")/Chart.yaml" ] && return 0
+  yq e 'true' "$1" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+mapfile -t YAML < <(pick '\.ya?ml$')
+mapfile -t K8S < <(for f in "${YAML[@]+"${YAML[@]}"}"; do
+  [[ "$f" =~ (^|/)\.(github|gitlab)/ || "$f" =~ \.gitlab-ci\.ya?ml$ || "$f" =~ \.sops\.ya?ml$ || "$(basename "$f")" =~ ^kustomization\.ya?ml$ ]] && continue
+  is_templated "$f" && continue
+  grep -qE '^apiVersion:' "$f" && grep -qE '^kind:' "$f" && echo "$f"
+done)
+
+# ---------------------------------------------------------------- 1. Secrets (gitleaks)
+chk_secrets() {
+  have gitleaks || { add "Secrets (gitleaks)" SKIP "gitleaks missing"; return; }
+  local log="$WORK/gitleaks.log" n=0 f
+  : > "$log"
+  if [ -n "$MB" ] && [ "$ALL" -eq 0 ]; then
+    if [ "$(git rev-list --count "$MB..HEAD" 2>/dev/null || echo 0)" -gt 0 ]; then
+      gitleaks git --no-banner --no-color --redact -v --log-opts="$MB..HEAD" . >>"$log" 2>&1 || n=$((n + 1))
+    fi
+    for f in "${FILES[@]+"${FILES[@]}"}"; do
+      gitleaks dir --no-banner --no-color --redact -v "$f" >>"$log" 2>&1 || n=$((n + 1))
+    done
+  else
+    gitleaks git --no-banner --no-color --redact -v . >>"$log" 2>&1 || n=$((n + 1))
+  fi
+  if [ $n -gt 0 ]; then add "Secrets (gitleaks)" FAIL "possible secrets found" "$log"
+  else add "Secrets (gitleaks)" PASS "no findings"; fi
+}
+
+# ---------------------------------------------------------------- 2. SOPS / plain-text secrets
+chk_sops() {
+  local log="$WORK/sops.log" bad=0 f
+  : > "$log"
+  for f in $(pick '\.sops\.(ya?ml|json|env)$'); do
+    if ! grep -q 'ENC\[' "$f" || ! grep -qE '^sops:|"sops":' "$f"; then
+      echo "$f: not (fully) SOPS-encrypted" >>"$log"; bad=1
+    fi
+  done
+  for f in "${YAML[@]+"${YAML[@]}"}"; do
+    [[ "$f" =~ \.sops\.ya?ml$ ]] && continue
+    if [ "$(yq e 'select(.kind == "Secret") | .kind' "$f" 2>/dev/null | head -1)" = "Secret" ]; then
+      echo "$f: plain-text Kubernetes Secret - encrypt as *.sops.yaml or use an ExternalSecret" >>"$log"; bad=1
+    fi
+  done
+  if [ $bad -eq 1 ]; then add "SOPS / plain-text secrets" FAIL "unencrypted secrets" "$log"
+  else add "SOPS / plain-text secrets" PASS "ok"; fi
+}
+
+# ---------------------------------------------------------------- 3. YAML
+chk_yaml() {
+  [ ${#YAML[@]} -eq 0 ] && { add "YAML lint" SKIP "no YAML files"; return; }
+  local log="$WORK/yaml.log" files=() f
+  for f in "${YAML[@]}"; do is_templated "$f" || files+=("$f"); done
+  [ ${#files[@]} -eq 0 ] && { add "YAML lint" SKIP "templates only"; return; }
+  if { [ -f .yamlfmt.yaml ] || [ -f .yamlfmt ] || [ -f yamlfmt.yaml ]; } && have yamlfmt; then
+    if yamlfmt -lint "${files[@]}" >"$log" 2>&1; then add "YAML format (yamlfmt)" PASS "${#files[@]} files"
+    else add "YAML format (yamlfmt)" WARN "formatting differences (yamlfmt <file> fixes them)" "$log"; fi
+  elif have yamllint; then
+    local args=(-d '{extends: relaxed, rules: {line-length: disable, truthy: disable, comments: disable}}')
+    if [ -f .yamllint ] || [ -f .yamllint.yaml ] || [ -f .yamllint.yml ]; then args=(); fi
+    yamllint -f parsable "${args[@]+"${args[@]}"}" "${files[@]}" >"$log" 2>&1
+    if grep -q '\[error\]' "$log"; then add "YAML lint (yamllint)" FAIL "$(grep -c '\[error\]' "$log") errors" "$log"
+    elif [ -s "$log" ]; then add "YAML lint (yamllint)" WARN "$(wc -l <"$log") hints" "$log"
+    else add "YAML lint (yamllint)" PASS "${#files[@]} files"; fi
+  fi
+}
+
+# ---------------------------------------------------------------- 4. Kubernetes manifests
+chk_k8s() {
+  [ ${#K8S[@]} -eq 0 ] && { add "Kubernetes schema (kubeconform)" SKIP "no manifests changed"; return; }
+  local log="$WORK/kubeconform.log"
+  mkdir -p "$HOME/.cache/kubeconform"
+  if kubeconform -strict -ignore-missing-schemas -summary -output text -cache "$HOME/.cache/kubeconform" \
+       -schema-location default \
+       -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+       "${K8S[@]}" >"$log" 2>&1; then
+    add "Kubernetes schema (kubeconform)" PASS "${#K8S[@]} manifests valid"
+  else
+    add "Kubernetes schema (kubeconform)" FAIL "invalid manifests" "$log"
+  fi
+
+  local kl="$WORK/kube-linter.log"
+  if kube-linter lint --format plain "${K8S[@]}" >"$kl" 2>&1; then
+    add "Kubernetes best practices (kube-linter)" PASS "no findings"
+  elif grep -q 'No valid objects found' "$kl"; then
+    add "Kubernetes best practices (kube-linter)" SKIP "no workloads (e.g. only HelmRelease) - see --deep"
+  else
+    add "Kubernetes best practices (kube-linter)" WARN "$(grep -c '^' "$kl") lines of findings" "$kl"
+  fi
+
+  # images: pinned (tag + ideally digest), not :latest
+  local il="$WORK/images.log" f
+  : > "$il"
+  for f in "${K8S[@]}"; do
+    yq e -N '.. | select(tag == "!!map" and has("repository")) | .repository + ":" + ((.tag // "") | tostring)' "$f" 2>/dev/null | sed "s|^|$f: |" >>"$il"
+    yq e -N '.. | select(tag == "!!map" and has("image") and (.image | tag) == "!!str") | .image' "$f" 2>/dev/null | sed "s|^|$f: |" >>"$il"
+  done
+  local bad; bad="$(grep -E ':$|:latest$|: [^:@]+$' "$il" | grep -v '\${' || true)"
+  if [ -n "$bad" ]; then echo "$bad" >"$WORK/images-bad.log"; add "Image pinning" WARN "images without fixed tag/digest" "$WORK/images-bad.log"
+  elif [ -s "$il" ]; then add "Image pinning" PASS "$(wc -l <"$il") images with tag"
+  fi
+}
+
+# ---------------------------------------------------------------- 5. IaC misconfiguration (trivy config)
+chk_trivy_config() {
+  have trivy || { add "IaC misconfig (trivy)" SKIP "trivy missing"; return; }
+  mapfile -t iac < <(pick '(\.ya?ml|\.json|\.tf|\.hcl|Dockerfile[^/]*|Containerfile|\.dockerfile)$')
+  [ ${#iac[@]} -eq 0 ] && { add "IaC misconfig (trivy)" SKIP "no IaC files"; return; }
+  local json="$WORK/trivy-config.json" log="$WORK/trivy-config.log"
+  trivy config --quiet --format json --severity MEDIUM,HIGH,CRITICAL --skip-dirs node_modules --skip-dirs .git . >"$json" 2>"$WORK/trivy-config.err" \
+    || { add "IaC misconfig (trivy)" WARN "trivy error" "$WORK/trivy-config.err"; return; }
+  jq -r --rawfile ch "$WORK/changed.txt" '
+      ($ch | split("\n")) as $c
+      | .Results[]? | select(.Target as $t | $c | index($t)) | . as $r
+      | .Misconfigurations[]? | "\(.Severity)\t\($r.Target)\t\(.ID)\t\(.Title)"' "$json" | sort -u >"$log"
+  local hi; hi="$(grep -cE '^(HIGH|CRITICAL)' "$log")"
+  if [ "$hi" -gt 0 ]; then add "IaC misconfig (trivy)" FAIL "$hi HIGH/CRITICAL in changed files" "$log"
+  elif [ -s "$log" ]; then add "IaC misconfig (trivy)" WARN "$(wc -l <"$log") MEDIUM" "$log"
+  else add "IaC misconfig (trivy)" PASS "${#iac[@]} files without findings"; fi
+}
+
+# ---------------------------------------------------------------- 6. Shell
+chk_shell() {
+  local sh=() f
+  for f in "${FILES[@]+"${FILES[@]}"}"; do
+    if [[ "$f" =~ \.(sh|bash)$ ]] || head -1 "$f" 2>/dev/null | grep -qE '^#!.*/(env )?(ba)?sh\b'; then sh+=("$f"); fi
+  done
+  [ ${#sh[@]} -eq 0 ] && { add "Shell (shellcheck)" SKIP "no shell scripts"; return; }
+  local log="$WORK/shellcheck.log"
+  shellcheck -f gcc "${sh[@]}" >"$log" 2>&1
+  if grep -q ': error:' "$log"; then add "Shell (shellcheck)" FAIL "$(grep -c ': error:' "$log") errors" "$log"
+  elif grep -q ': warning:' "$log"; then add "Shell (shellcheck)" WARN "$(grep -c ': warning:' "$log") warnings" "$log"
+  else add "Shell (shellcheck)" PASS "${#sh[@]} scripts"; fi
+}
+
+# ---------------------------------------------------------------- 7. Dockerfiles
+chk_docker() {
+  mapfile -t df < <(pick '(^|/)(Dockerfile[^/]*|Containerfile|[^/]+\.dockerfile)$')
+  [ ${#df[@]} -eq 0 ] && return
+  local log="$WORK/hadolint.log" f c
+  local -a cfg
+  : >"$log"
+  for f in "${df[@]}"; do
+    # use a .hadolint.yaml next to the Dockerfile, otherwise the one in the repo root
+    cfg=(); for c in "$(dirname "$f")/.hadolint.yaml" ".hadolint.yaml"; do [ -f "$c" ] && { cfg=(--config "$c"); break; }; done
+    hadolint --no-color "${cfg[@]+"${cfg[@]}"}" "$f" >>"$log" 2>&1
+  done
+  if grep -qE ' (DL|SC)[0-9]+ error:' "$log"; then add "Dockerfile (hadolint)" FAIL "errors" "$log"
+  elif [ -s "$log" ]; then add "Dockerfile (hadolint)" WARN "$(wc -l <"$log") hints" "$log"
+  else add "Dockerfile (hadolint)" PASS "${#df[@]} files"; fi
+}
+
+# ---------------------------------------------------------------- 8. PowerShell
+chk_pwsh() {
+  mapfile -t ps < <(pick '\.(ps1|psm1|psd1)$')
+  [ ${#ps[@]} -eq 0 ] && return
+  have pwsh || { add "PowerShell (PSScriptAnalyzer)" SKIP "pwsh missing"; return; }
+  local log="$WORK/psscriptanalyzer.log" script="$WORK/psa.ps1"
+  cat >"$script" <<'PS'
+$ErrorActionPreference = 'Stop'
+$r = foreach ($f in $args) { Invoke-ScriptAnalyzer -Path $f -Severity Error,Warning }
+$r | ForEach-Object { "{0}`t{1}:{2}`t{3}`t{4}" -f $_.Severity, $_.ScriptName, $_.Line, $_.RuleName, $_.Message }
+PS
+  pwsh -NoLogo -NoProfile -File "$script" "${ps[@]}" >"$log" 2>&1
+  if grep -qE '^(Error|ParseError)' "$log"; then add "PowerShell (PSScriptAnalyzer)" FAIL "$(grep -cE '^(Error|ParseError)' "$log") errors" "$log"
+  elif [ -s "$log" ]; then add "PowerShell (PSScriptAnalyzer)" WARN "$(wc -l <"$log") warnings" "$log"
+  else add "PowerShell (PSScriptAnalyzer)" PASS "${#ps[@]} files"; fi
+}
+
+# ---------------------------------------------------------------- 9. Ansible
+chk_ansible() {
+  local roots=() f d
+  for f in "${YAML[@]+"${YAML[@]}"}"; do
+    [[ "$f" =~ (^|/)(roles|playbooks|tasks|handlers|group_vars|host_vars|inventory|inventories)/ || "$f" =~ (playbook|site|main)\.ya?ml$ ]] \
+      || grep -qE '^- (hosts|import_playbook):' "$f" || continue
+    d="$(dirname "$f")"
+    while [ "$d" != "." ] && [ "$d" != "/" ] && [ ! -e "$d/ansible.cfg" ] && [ ! -e "$d/.ansible-lint" ] && [ ! -e "$d/requirements.yml" ]; do d="$(dirname "$d")"; done
+    if [ ! -e "$d/ansible.cfg" ] && [ ! -e "$d/.ansible-lint" ] && [ ! -e "$d/requirements.yml" ]; then
+      # no marker file: the project root is the folder that contains roles/ or playbooks/ (else the file's folder)
+      if [[ "$f" =~ ^(.*/)?(roles|playbooks)/ ]]; then d="${BASH_REMATCH[1]:-.}"; d="${d%/}"; else d="$(dirname "$f")"; fi
+    fi
+    [[ " ${roots[*]-} " == *" $d "* ]] || roots+=("$d")
+  done
+  [ ${#roots[@]} -eq 0 ] && return
+  local log="$WORK/ansible-lint.log" json
+  : > "$log"
+  for d in "${roots[@]}"; do
+    json="$WORK/ansible-lint-$(echo "$d" | tr '/.' '__').json"
+    (cd "$d" && ansible-lint --nocolor -f codeclimate -q >"$json" 2>>"$log")
+    jq -r --arg d "$d" '.[] | "\(.severity)\t\($d)/\(.location.path):\(.location.lines.begin // .location.positions.begin.line // "")\t\(.check_name)\t\(.description)"' "$json" >>"$log" 2>/dev/null
+  done
+  if grep -qE '^(blocker|critical)' "$log"; then add "Ansible (ansible-lint)" FAIL "$(grep -cE '^(blocker|critical)' "$log") severe findings" "$log"
+  elif grep -qE '^(major|minor|info)' "$log"; then add "Ansible (ansible-lint)" WARN "$(grep -cE '^(major|minor|info)' "$log") hints" "$log"
+  else add "Ansible (ansible-lint)" PASS "${#roots[@]} project(s)"; fi
+}
+
+# ---------------------------------------------------------------- 10. GitHub Actions
+chk_actions() {
+  mapfile -t wf < <(pick '^\.github/(workflows/[^/]+|actions/.+/action)\.ya?ml$')
+  [ ${#wf[@]} -eq 0 ] && return
+  local log="$WORK/actionlint.log" zlog="$WORK/zizmor.log"
+  mapfile -t onlywf < <(printf '%s\n' "${wf[@]}" | grep '^\.github/workflows/')
+  if [ ${#onlywf[@]} -gt 0 ] && ! actionlint -no-color "${onlywf[@]}" >"$log" 2>&1; then
+    add "GitHub Actions (actionlint)" FAIL "errors" "$log"
+  else add "GitHub Actions (actionlint)" PASS "${#wf[@]} files"; fi
+  env -u GH_TOKEN -u GITHUB_TOKEN zizmor --offline --format json "${wf[@]}" >"$WORK/zizmor.json" 2>"$WORK/zizmor.err"
+  jq -r '.[]? | "\(.determinations.severity)\t\(.locations[0].symbolic.key.Local.verbatim_path // .locations[0].symbolic.key.Local.given_path // "?"):\((.locations[0].concrete.location.start_point.row // 0) + 1)\t\(.ident)\t\(.desc)"' \
+    "$WORK/zizmor.json" >"$zlog" 2>/dev/null
+  if [ ! -s "$WORK/zizmor.json" ]; then add "Actions security (zizmor)" WARN "zizmor did not run" "$WORK/zizmor.err"
+  elif grep -qi '^high' "$zlog"; then add "Actions security (zizmor)" FAIL "$(grep -ci '^high' "$zlog") high findings" "$zlog"
+  elif grep -qiE '^(medium|low)' "$zlog"; then add "Actions security (zizmor)" WARN "$(grep -ciE '^(medium|low)' "$zlog") findings" "$zlog"
+  else add "Actions security (zizmor)" PASS "no findings"; fi
+}
+
+# ---------------------------------------------------------------- 10b. GitLab CI
+chk_gitlab_ci() {
+  mapfile -t gci < <(pick '(^|/)\.gitlab-ci\.ya?ml$|^\.gitlab/ci/.+\.ya?ml$')
+  [ ${#gci[@]} -eq 0 ] && return
+  local log="$WORK/gitlab-ci-lint.log" f rc=0
+  : >"$log"
+  if [ -z "${GITLAB_TOKEN:-}" ]; then add "GitLab CI (glab ci lint)" SKIP "GITLAB_TOKEN missing - only YAML lint"; return; fi
+  for f in "${gci[@]}"; do
+    echo "### $f" >>"$log"
+    glab ci lint "$f" >>"$log" 2>&1 || rc=1
+  done
+  if [ $rc -eq 0 ]; then add "GitLab CI (glab ci lint)" PASS "${#gci[@]} files"
+  elif grep -qiE 'invalid|error' "$log"; then add "GitLab CI (glab ci lint)" FAIL "invalid CI configuration" "$log"
+  else add "GitLab CI (glab ci lint)" WARN "lint did not run (network/permissions?)" "$log"; fi
+}
+
+# ---------------------------------------------------------------- 11. SAST (semgrep)
+chk_semgrep() {
+  mapfile -t code < <(pick '\.(py|js|jsx|mjs|cjs|ts|tsx|go|java|kt|rb|php|rs|c|cc|cpp|h|cs|swift|scala|sh|bash|html|vue|svelte|tf)$')
+  [ ${#code[@]} -eq 0 ] && { add "SAST (semgrep)" SKIP "no code changed"; return; }
+  have semgrep || { add "SAST (semgrep)" SKIP "semgrep missing"; return; }
+  local json="$WORK/semgrep.json" log="$WORK/semgrep.log"
+  semgrep scan --config p/default --metrics off --quiet --json "${code[@]}" >"$json" 2>"$WORK/semgrep.err"
+  jq -r '.results[]? | "\(.extra.severity)\t\(.path):\(.start.line)\t\(.check_id | split(".") | last)\t\(.extra.message | gsub("\n"; " ") | .[0:160])"' "$json" >"$log" 2>/dev/null
+  if [ ! -s "$json" ]; then add "SAST (semgrep)" WARN "semgrep did not run (network?)" "$WORK/semgrep.err"
+  elif grep -q '^ERROR' "$log"; then add "SAST (semgrep)" FAIL "$(grep -c '^ERROR' "$log") ERROR findings" "$log"
+  elif [ -s "$log" ]; then add "SAST (semgrep)" WARN "$(wc -l <"$log") findings" "$log"
+  else add "SAST (semgrep)" PASS "${#code[@]} files"; fi
+}
+
+# ---------------------------------------------------------------- 12. dependencies (trivy fs)
+chk_deps() {
+  mapfile -t lock < <(pick '(^|/)(package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|go\.(mod|sum)|requirements[^/]*\.txt|pyproject\.toml|uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|Cargo\.lock|composer\.lock|requirements\.ya?ml)$')
+  [ ${#lock[@]} -eq 0 ] && [ "$DEEP" -eq 0 ] && return
+  have trivy || return
+  local json="$WORK/trivy-vuln.json" log="$WORK/trivy-vuln.log"
+  trivy fs --quiet --scanners vuln --format json --severity HIGH,CRITICAL --skip-dirs node_modules . >"$json" 2>"$WORK/trivy-vuln.err" \
+    || { add "Dependencies (trivy)" WARN "trivy error" "$WORK/trivy-vuln.err"; return; }
+  local only=1; { [ "$DEEP" -eq 1 ] || [ "$ALL" -eq 1 ]; } && only=0
+  jq -r --rawfile ch "$WORK/changed.txt" --argjson only "$only" '
+      ($ch | split("\n")) as $c
+      | .Results[]? | .Target as $t | select($only == 0 or ($c | index($t)))
+      | .Vulnerabilities[]? | "\(.Severity)\t\($t)\t\(.PkgName)@\(.InstalledVersion)\t\(.VulnerabilityID)\tfix: \(.FixedVersion // "-")"' "$json" | sort -u >"$log"
+  if grep -q '^CRITICAL' "$log"; then add "Dependencies (trivy)" FAIL "$(grep -c '^CRITICAL' "$log") CRITICAL" "$log"
+  elif [ -s "$log" ]; then add "Dependencies (trivy)" WARN "$(wc -l <"$log") HIGH" "$log"
+  else add "Dependencies (trivy)" PASS "no HIGH/CRITICAL"; fi
+}
+
+# ---------------------------------------------------------------- 13. Tests
+chk_tests() {
+  [ "$TESTS" -eq 0 ] && return
+  local roots=() f d
+  for f in "${FILES[@]+"${FILES[@]}"}"; do
+    d="$(dirname "$f")"
+    while :; do
+      if [ -f "$d/go.mod" ] || [ -f "$d/package.json" ]; then [[ " ${roots[*]-} " == *" $d "* ]] || roots+=("$d"); break; fi
+      [ "$d" = "." ] && break; d="$(dirname "$d")"
+    done
+  done
+  local log="$WORK/tests.log" rc=0 ran=0
+  : > "$log"
+  for d in "${roots[@]+"${roots[@]}"}"; do
+    if [ -f "$d/go.mod" ]; then
+      ran=1; echo "### $d: go vet + go test" >>"$log"
+      (cd "$d" && go vet ./... && go test ./...) >>"$log" 2>&1 || rc=1
+    fi
+    if [ -f "$d/package.json" ] && jq -e '.scripts.test and (.scripts.test | test("no test specified") | not)' "$d/package.json" >/dev/null 2>&1; then
+      if [ ! -d "$d/node_modules" ]; then echo "### $d: node_modules missing - run npm ci / bun install first" >>"$log"; continue; fi
+      ran=1; echo "### $d: test" >>"$log"
+      local pm=npm; [ -f "$d/bun.lock" ] || [ -f "$d/bun.lockb" ] && pm=bun; [ -f "$d/pnpm-lock.yaml" ] && pm=pnpm
+      (cd "$d" && CI=1 $pm test) >>"$log" 2>&1 || rc=1
+    fi
+  done
+  if [ -n "$(pick '\.(ps1|psm1)$')" ] && [ -n "$(git ls-files '*.Tests.ps1')" ]; then
+    ran=1; echo "### Pester" >>"$log"
+    pwsh -NoLogo -NoProfile -Command 'Invoke-Pester -CI -Output Detailed' >>"$log" 2>&1 || rc=1
+  fi
+  [ $ran -eq 0 ] && { add "Tests" SKIP "no test setup detected for the changed parts"; return; }
+  if [ $rc -eq 0 ]; then add "Tests" PASS "green" "$log"; else add "Tests" FAIL "tests failed" "$log"; fi
+}
+
+# ---------------------------------------------------------------- 13b. documentation
+chk_docs() {
+  mapfile -t md < <(pick '\.(md|markdown)$')
+  [ ${#md[@]} -eq 0 ] && return
+  local log="$WORK/docs.log" warnlog="$WORK/docs-warn.log" f t dir target n
+  : >"$log"; : >"$warnlog"
+  for f in "${md[@]}"; do
+    # documentation templates declare themselves ("Template for ...") and contain placeholders on purpose
+    head -n 5 "$f" | grep -q 'Template for' && continue
+    dir="$(dirname "$f")"
+    # unclosed code fences (``` or ~~~ at the start of a line, up to 3 spaces indent)
+    n="$(grep -cE '^ {0,3}(```|~~~)' "$f" || true)"
+    [ $((n % 2)) -eq 1 ] && echo "$f: unclosed code fence ($n fence lines)" >>"$log"
+    # relative links: [text](target) and reference definitions [id]: target
+    { grep -oE '\]\([^) ]+( "[^"]*")?\)' "$f" | sed -E 's/^\]\(//; s/( "[^"]*")?\)$//'
+      grep -oE '^ {0,3}\[[^]]+\]: *[^ ]+' "$f" | sed -E 's/^ {0,3}\[[^]]+\]: *//'; } 2>/dev/null |
+    while IFS= read -r t; do
+      case "$t" in http://*|https://*|mailto:*|tel:*|\#*|*'{{'*|*'${'*|'<'*) continue ;; esac
+      target="${t%%#*}"; target="${target%%\?*}"; target="${target//%20/ }"
+      [ -z "$target" ] && continue
+      if [[ "$target" == /* ]]; then target=".${target}"; else target="$dir/$target"; fi
+      [ -e "$target" ] || echo "$f: broken relative link -> $t" >>"$log"
+    done
+    # leftovers from templates or unfinished writing
+    grep -nE '(used by the docs-writer|must not end up in the result|<Project name>|\bTODO[:(]|\bTBD[:)]|\bFIXME[:(])' "$f" \
+      | sed "s|^|$f:|" >>"$warnlog" || true
+  done
+  if [ -s "$log" ]; then cat "$warnlog" >>"$log"; add "Documentation (links, fences)" FAIL "$(wc -l <"$log") problems" "$log"
+  elif [ -s "$warnlog" ]; then add "Documentation (links, fences)" WARN "$(wc -l <"$warnlog") template leftovers/TODOs" "$warnlog"
+  else add "Documentation (links, fences)" PASS "${#md[@]} files"; fi
+}
+
+# ---------------------------------------------------------------- 14. Flux (only --deep)
+chk_flux() {
+  [ "$DEEP" -eq 1 ] || return
+  [ -d kubernetes/flux/cluster ] || return
+  [ -n "$(pick '^kubernetes/')" ] || [ "$ALL" -eq 1 ] || return
+  have flux-local || { add "Flux rendering (flux-local)" SKIP "flux-local missing"; return; }
+  local log="$WORK/flux-local-test.log"
+  if timeout 900 flux-local test --enable-helm --all-namespaces --path kubernetes/flux/cluster >"$log" 2>&1; then
+    add "Flux rendering (flux-local test)" PASS "cluster renders"
+  else add "Flux rendering (flux-local test)" FAIL "rendering/validation failed" "$log"; fi
+  if [ -n "$MB" ]; then
+    local orig diff="$WORK/flux-local-diff.log" r
+    orig="$(mktemp -d)/base"
+    git worktree add -q --detach "$orig" "$MB" 2>/dev/null && {
+      : >"$diff"
+      for r in helmrelease kustomization; do
+        timeout 600 flux-local diff "$r" --unified 6 --all-namespaces --sources flux-system \
+          --strip-attrs "helm.sh/chart,checksum/config,app.kubernetes.io/version,chart" \
+          --path kubernetes/flux/cluster --path-orig "$orig/kubernetes/flux/cluster" >>"$diff" 2>&1
+      done
+      git worktree remove --force "$orig" >/dev/null 2>&1
+      add "Flux diff (rendered change)" INFO "$(grep -cE '^[+-][^+-]' "$diff") changed lines" "$diff"
+    }
+  fi
+}
+
+# ---------------------------------------------------------------- 15. project-specific checks
+chk_project() {
+  [ -x .sandbox/checks.sh ] || return
+  local log="$WORK/project-checks.log" rc
+  ./.sandbox/checks.sh "${FILES[@]+"${FILES[@]}"}" >"$log" 2>&1; rc=$?
+  case $rc in 0) add "Project checks (.sandbox/checks.sh)" PASS "ok" "$log" ;;
+              2) add "Project checks (.sandbox/checks.sh)" WARN "hints" "$log" ;;
+              *) add "Project checks (.sandbox/checks.sh)" FAIL "failed" "$log" ;; esac
+}
+
+# ---------------------------------------------------------------- run
+if [ ${#FILES[@]} -eq 0 ]; then
+  echo "No changed files compared to ${BASE:-?} - nothing to check."
+  exit 0
+fi
+[ "$QUIET" -eq 0 ] && echo "devsecops-gate: ${#FILES[@]} file(s) against ${BASE:-?} ($(git rev-parse --short "$MB" 2>/dev/null)) ..." >&2
+for c in chk_secrets chk_sops chk_yaml chk_k8s chk_trivy_config chk_shell chk_docker chk_pwsh chk_ansible chk_actions chk_gitlab_ci chk_semgrep chk_deps chk_tests chk_docs chk_flux chk_project; do
+  [ "$QUIET" -eq 0 ] && printf '  - %s\n' "${c#chk_}" >&2
+  "$c"
+done
+
+# ---------------------------------------------------------------- report
+fail=0; warn=0
+for s in "${R_STATUS[@]}"; do [ "$s" = FAIL ] && fail=$((fail + 1)); [ "$s" = WARN ] && warn=$((warn + 1)); done
+icon() { case "$1" in PASS) echo "✅ PASS";; FAIL) echo "❌ FAIL";; WARN) echo "⚠️ WARN";; INFO) echo "ℹ️ INFO";; *) echo "➖ SKIP";; esac; }
+{
+  if [ $fail -gt 0 ]; then echo "## DevSecOps gate: ❌ blocked ($fail blocking, $warn warnings)"
+  else echo "## DevSecOps gate: ✅ passed ($warn warnings)"; fi
+  echo
+  echo "Base \`${BASE:-?}\` @ \`$(git rev-parse --short "$MB" 2>/dev/null)\` · ${#FILES[@]} changed files · $(date '+%Y-%m-%d %H:%M')"
+  echo
+  echo "| Check | Result | Summary |"
+  echo "|---|---|---|"
+  for i in "${!R_NAME[@]}"; do echo "| ${R_NAME[$i]} | $(icon "${R_STATUS[$i]}") | ${R_SUM[$i]} |"; done
+  if [ "$QUIET" -eq 0 ]; then
+    for i in "${!R_NAME[@]}"; do
+      [ -n "${R_LOG[$i]}" ] && [ -s "${R_LOG[$i]}" ] || continue
+      case "${R_STATUS[$i]}" in FAIL|WARN|INFO) ;; *) continue ;; esac
+      echo
+      echo "<details><summary>${R_NAME[$i]} - details</summary>"
+      echo
+      echo '```'
+      head -n 60 "${R_LOG[$i]}" | sed -E 's/(AGE-SECRET-KEY-|gh[pousr]_)[A-Za-z0-9]+/\1***REDACTED***/g'
+      [ "$(wc -l <"${R_LOG[$i]}")" -gt 60 ] && echo "... ($(wc -l <"${R_LOG[$i]}") lines, full log in ${R_LOG[$i]})"
+      echo '```'
+      echo "</details>"
+    done
+  fi
+} >"$REPORT"
+
+cat "$REPORT"
+echo >&2
+echo "Report: $REPORT  (logs: $WORK)" >&2
+[ $fail -gt 0 ] && exit 1
+exit 0

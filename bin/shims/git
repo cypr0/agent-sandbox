@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Shim in front of /usr/bin/git (first in PATH): checks push/commit against the
+# sandbox policy, then calls the real git. Applies to every agent and every
+# shell in the container - including Hermes.
+real=/usr/bin/git
+dir="$PWD"
+i=1
+sub=""
+while [ $i -le $# ]; do
+  a="${!i}"
+  case "$a" in
+    -C) j=$((i + 1)); dir="${!j}"; i=$((i + 2)); continue ;;
+    -c|--git-dir|--work-tree|--namespace|--exec-path) i=$((i + 2)); continue ;;
+    -*) i=$((i + 1)); continue ;;
+    *) sub="$a"; break ;;
+  esac
+done
+
+case "$sub" in
+  push)
+    rest=("${@:$((i + 1))}")
+    sandbox-guard --check "git push ${rest[*]}" "$dir" || exit 2
+    ;;
+  commit|cherry-pick|revert|am)
+    # No commit directly on main/master in repos with a remote (new local repos are fine)
+    if [ -z "${SANDBOX_ALLOW_MAIN_COMMIT:-}" ] && "$real" -C "$dir" remote get-url origin >/dev/null 2>&1; then
+      br="$("$real" -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null)"
+      prot=" main master ${PROTECTED_BRANCHES:-} "
+      if [ -n "$br" ] && [[ "$prot" == *" $br "* ]]; then
+        echo "sandbox-guard: BLOCKED - commit on '$br'. Create a branch first: git switch -c agent/<issue>-<slug>" >&2
+        exit 2
+      fi
+    fi
+    ;;
+esac
+exec "$real" "$@"

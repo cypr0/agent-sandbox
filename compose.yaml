@@ -1,0 +1,105 @@
+name: ${SANDBOX_NAME:-agent-sandbox}
+
+services:
+  sandbox:
+    build:
+      context: ./docker
+      args:
+        TZ: ${TZ:-Europe/Berlin}
+        USER_UID: ${SANDBOX_UID:-1000}
+        USER_GID: ${SANDBOX_GID:-1000}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-stable}
+        HERMES_VERSION: ${HERMES_VERSION:-v0.22.2}
+        CACHE_BUST_AGENTS: ${CACHE_BUST_AGENTS:-0}
+        EXTRA_APT_PACKAGES: ${EXTRA_APT_PACKAGES:-}
+    image: ${SANDBOX_IMAGE:-agent-sandbox:local}
+    container_name: ${SANDBOX_NAME:-agent-sandbox}
+    hostname: ${SANDBOX_NAME:-agent-sandbox}
+
+    # Runs in the background; ./sandbox.sh attaches via "docker compose exec".
+    command: ["sleep", "infinity"]
+    init: true
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    working_dir: /workspace
+
+    # Hardening: no root, no capabilities, no sudo/setuid, no Docker socket.
+    # Agents install extra tools in user space (mise, uv, npm, go install).
+    user: dev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    cpus: ${SANDBOX_CPUS:-4}
+    mem_limit: ${SANDBOX_MEMORY:-8g}
+    pids_limit: 4096
+
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      # Git identity of the agents
+      GIT_USER_NAME: ${GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
+      # GitHub: gh + git (HTTPS) authenticate with this token
+      GH_TOKEN: ${GH_TOKEN:-}
+      GH_HOST: ${GH_HOST:-github.com}
+      GH_PROMPT_DISABLED: "1"
+      # GitLab: glab + git (HTTPS) authenticate with this token
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      GITLAB_HOST: ${GITLAB_HOST:-gitlab.com}
+      GLAB_CHECK_UPDATE: "false"
+      # Ticket workflow
+      TICKET_DEFAULT_REPO: ${TICKET_DEFAULT_REPO:-}
+      TICKET_REPOS: ${TICKET_REPOS:-}
+      TICKET_TRANSLATE: ${TICKET_TRANSLATE:-1}
+      PROTECTED_BRANCHES: ${PROTECTED_BRANCHES:-}
+      # Documentation writer (/write-docs, docs-license)
+      DOCS_LICENSE_DEFAULT: ${DOCS_LICENSE_DEFAULT:-}
+      DOCS_COPYRIGHT_HOLDER: ${DOCS_COPYRIGHT_HOLDER:-}
+      DOCS_SECURITY_CONTACT: ${DOCS_SECURITY_CONTACT:-}
+      # Claude Code: leave empty for subscription login (/login in the container)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Hermes: keys are written to $HERMES_HOME/.env by the entrypoint
+      HERMES_PROVIDER: ${HERMES_PROVIDER:-}
+      HERMES_MODEL: ${HERMES_MODEL:-}
+      HERMES_BASE_URL: ${HERMES_BASE_URL:-}
+      HERMES_OPENROUTER_API_KEY: ${HERMES_OPENROUTER_API_KEY:-}
+      HERMES_ANTHROPIC_API_KEY: ${HERMES_ANTHROPIC_API_KEY:-}
+      HERMES_OPENAI_API_KEY: ${HERMES_OPENAI_API_KEY:-}
+      # Copy templates from config/ into the volumes on every start (1) or only once (0)
+      SEED_OVERWRITE: ${SEED_OVERWRITE:-0}
+      # Optional read-only cluster access (scripts/k8s-readonly-access.sh)
+      KUBECONFIG: /home/dev/.secrets/kubeconfig
+
+    volumes:
+      # Projects (Git clones) - visible on the host, e.g. in VS Code
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+      # Sandbox configuration and tools: editable on the host, read-only in the container
+      - ./config:/opt/sandbox/config:ro
+      - ./bin:/opt/sandbox/bin:ro
+      - ./templates:/opt/sandbox/templates:ro
+      # Claude Code: managed policy (cannot be overridden) + shared skills/subagents
+      - ./config/claude:/etc/claude-code:ro
+      - ./config/skills:/home/dev/.claude/skills:ro
+      - ./config/agents:/home/dev/.claude/agents:ro
+      # State (logins, sessions, memory) lives in volumes, not on the host
+      - claude-home:/home/dev/.claude
+      - hermes-home:/home/dev/.hermes
+      - sandbox-cache:/home/dev/.cache
+      - mise-data:/home/dev/.local/share/mise
+      - go-home:/home/dev/go
+      # Optional: read-only kubeconfig etc. (folder is excluded via .gitignore)
+      - ./secrets:/home/dev/.secrets:ro
+
+    ports:
+      - "127.0.0.1:${PORT_WEB:-3000}:3000"
+      - "127.0.0.1:${PORT_VITE:-5173}:5173"
+      - "127.0.0.1:${PORT_ALT:-8080}:8080"
+
+volumes:
+  claude-home:
+  hermes-home:
+  sandbox-cache:
+  mise-data:
+  go-home:

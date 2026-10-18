@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# sandbox-guard - shared command policy for every agent in the sandbox.
+#
+#   sandbox-guard --check "<command>" [cwd]  exit 0 = allowed, exit 2 = blocked (reason on stderr)
+#   sandbox-guard --claude-hook             PreToolUse hook for Claude Code (JSON on stdin)
+#   sandbox-guard --hermes-hook             pre_tool_call hook for Hermes (JSON on stdin)
+#
+# This prevents accidents; it is not a security boundary. The real boundaries are:
+# a container without capabilities, tokens with minimal permissions, branch
+# protection on GitHub/GitLab, and read-only RBAC in the cluster.
+set -uo pipefail
+
+deny() {
+  echo "sandbox-guard: BLOCKED - $1" >&2
+  echo "If this is really needed: propose the step to the human instead of running it yourself." >&2
+  exit 2
+}
+
+PROT="main|master${PROTECTED_BRANCHES:+|${PROTECTED_BRANCHES// /|}}"
+
+# Checks the argument segment of a "git push" (up to the next ; & |)
+check_push() {
+  local seg="$1" cwd="$2" tok dst n=0 have_ref=0
+  local -a toks
+  read -r -a toks <<<"$seg"
+  for tok in "${toks[@]}"; do
+    case "$tok" in
+      --mirror|--all|--delete|-d|--prune) deny "git push $tok" ;;
+      --force|-f|--force-if-includes) deny "force push (allowed: --force-with-lease on agent/* branches)" ;;
+      --force-with-lease*) : ;;
+      -*) : ;;
+      *)
+        n=$((n + 1))
+        [ "$n" -eq 1 ] && continue          # first non-option argument = remote
+        have_ref=1
+        [[ "$tok" == +* ]] && deny "force push via +refspec"
+        dst="${tok#+}"; dst="${dst##*:}"; dst="${dst#refs/heads/}"
+        if [ "$dst" = "HEAD" ]; then dst="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)"; fi
+        [[ "$dst" =~ ^($PROT)$ ]] && deny "push to protected branch '$dst' - changes only via pull/merge request"
+        ;;
+    esac
+  done
+  if [ "$have_ref" -eq 0 ]; then
+    dst="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [[ "$dst" =~ ^($PROT)$ ]] && deny "push from protected branch '$dst' - create an agent/* branch first"
+  fi
+  return 0
+}
+
+# m '<regex>' - does the (whole) command match? Regexes live in strings so ;&| are allowed.
+m() { [[ "$c" =~ $1 ]]; }
+
+check() {
+  local c="$1" cwd="${2:-$PWD}" seg
+  c="${c//$'\n'/ }"
+  local S='[[:space:]]' E='([[:space:]]|$)' NS='[^|;&]*'
+
+  # ---- do not bypass the guard
+  m "/usr/(local/)?bin/(git|gh|glab)$E" && deny "direct call of the real git/gh/glab binary (guard bypass)"
+  m "SANDBOX_ALLOW_" && deny "setting SANDBOX_ALLOW_* from an agent"
+
+  # ---- Git
+  if m "git($S+-C$S+([^[:space:]]+))?$S+push$E"; then
+    [ -n "${BASH_REMATCH[2]:-}" ] && cwd="${BASH_REMATCH[2]}"
+    seg="${c#*push}"; seg="${seg%%[;&|]*}"
+    check_push "$seg" "$cwd"
+  fi
+  m "git$S$NS(reset$S+--hard$S+origin/($PROT)$E|branch$S+-D$S+($PROT)$E)" && deny "destructive git operation on a protected branch"
+  m "git$S+config$S+(--global$S+)?(core\.hooksPath|credential\.|url\.)" && deny "change of git security configuration"
+
+  # ---- GitHub: the human merges, the agent does not manage repository settings
+  m "gh$S+pr$S+merge" && deny "gh pr merge - merging is done by the human"
+  m "gh$S+pr$S+review$S$NS(--approve|$S-a$E)" && deny "PR approval by an agent"
+  m "gh$S+repo$S+(delete|edit|archive|rename|deploy-key)" && deny "repository administration"
+  m "gh$S+(secret|variable|ruleset|auth$S+(login|logout|refresh|token)|release$S+delete|issue$S+delete|cache$S+delete|workflow$S+(disable|enable))" && deny "secrets/auth/rulesets/deletion"
+  if m "gh$S+api$S"; then
+    m "(-X|--method)$S*DELETE" && deny "gh api DELETE"
+    m "(rulesets|/protection|collaborators|/hooks|/keys|actions/secrets|actions/variables|/environments|/merge([[:space:]\"']|$)|/pulls/[0-9]+/reviews)" && deny "gh api on repository settings, merge or reviews"
+  fi
+
+  # ---- GitLab: same rules for glab
+  m "glab$S+mr$S+(merge|approve|revoke|delete)" && deny "glab mr merge/approve/delete - merging and approving is done by the human"
+  m "glab$S+(repo$S+(delete|archive|transfer|update)|variable|deploy-key|ssh-key|token|auth$S+(login|logout)|release$S+delete|issue$S+delete|schedule$S+delete|cluster)" && deny "repository administration/secrets/auth/deletion"
+  if m "glab$S+api$S"; then
+    m "(-X|--method)$S*DELETE" && deny "glab api DELETE"
+    m "(protected_branches|protected_tags|/members|/hooks|deploy_keys|/variables|access_tokens|/merge([[:space:]\"'?]|$)|/approve|/approvals|push_rule|/share)" && deny "glab api on project settings, merge or approvals"
+  fi
+
+  # ---- Kubernetes / Flux / Helm / Talos: read-only - changes go through GitOps
+  if m "(^|[[:space:];&|(])(kubectl|k)$S" && ! m "--dry-run|auth$S+can-i"; then
+    m "(kubectl|k)$S+([^|;&]*$S)?(apply|create|delete|edit|patch|replace|scale|autoscale|drain|cordon|uncordon|taint|annotate|label|set|exec|attach|cp|debug|run|expose|rollout$S+(restart|undo|pause|resume))$E" \
+      && deny "kubectl with write effect - cluster changes only via GitOps"
+  fi
+  m "flux$S+(reconcile|suspend|resume|delete|create|bootstrap|install|uninstall|push)$E" && deny "flux with write effect"
+  m "helm$S+(install|upgrade|uninstall|delete|rollback|push)$E" && deny "helm install/upgrade/uninstall"
+  m "talosctl$S+([^|;&]*$S)?(apply-config|apply|upgrade|upgrade-k8s|reset|reboot|shutdown|bootstrap|edit|patch|rotate-ca|wipe|etcd$S+(remove-member|forfeit-leadership|leave|defrag|snapshot))$E" && deny "talosctl with write effect"
+
+  # ---- secrets
+  m "sops$S+([^|;&]*$S)?(-d|--decrypt|decrypt|edit|set|unset|rotate|updatekeys)$E" && deny "SOPS decryption/editing - secrets stay encrypted"
+  if m "(age\.key|\.agekey|keys\.txt|\.secrets/|talosconfig|\.ssh/id_|\.credentials\.json|hermes/\.env|hermes/auth\.json|glab-cli/config)" \
+     && ! m "^[[:space:]]*(grep|rg|git$S+(status|diff|log|check-ignore))$S"; then
+    deny "access to keys/credentials"
+  fi
+
+  # ---- Ansible against real hosts only as dry run
+  if m "ansible-playbook$E" && ! m "(--check|$S-C$E|--syntax-check|--list-tasks|--list-hosts|--list-tags|--version|--help)"; then
+    deny "ansible-playbook without --check/--syntax-check - real runs are started by the human"
+  fi
+  if m "(^|[[:space:];&|])ansible$S+[^-[:space:]]" && ! m "--check" \
+     && m "(-m$S*(shell|command|raw|script|copy|template|file|lineinfile|apt|dnf|yum|package|service|systemd|reboot|user)$E|$S-a$S)"; then
+    deny "ad-hoc Ansible with write effect"
+  fi
+
+  # ---- executing code from the internet, destruction
+  m "(curl|wget)[^|]*\|$S*(sudo$S+)?(ba|z|da)?sh([[:space:];]|$)" && deny "curl|sh - do not run install scripts from the internet directly"
+  m "rm$S+-[a-zA-Z]*[rR][a-zA-Z]*$S+(/|~|/workspace|/home/dev|\\\$HOME|/opt/sandbox)/?$E" && deny "rm -r on a root directory"
+
+  return 0
+}
+
+case "${1:-}" in
+  --check)
+    check "${2:-}" "${3:-$PWD}"
+    ;;
+  --claude-hook)
+    # {"tool_name":"Bash","cwd":"...","tool_input":{"command":"..."}} - exit 2 blocks, stderr goes to Claude
+    in="$(cat)"
+    cmd="$(jq -r '.tool_input.command // empty' <<<"$in" 2>/dev/null)"
+    cwd="$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null)"
+    [ -n "$cmd" ] && check "$cmd" "${cwd:-$PWD}"
+    exit 0
+    ;;
+  --hermes-hook)
+    # {"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"..."},"cwd":"..."}
+    in="$(cat)"
+    cmd="$(jq -r '.tool_input.command // .args.command // empty' <<<"$in" 2>/dev/null)"
+    cwd="$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null)"
+    [ -n "$cmd" ] && check "$cmd" "${cwd:-$PWD}"
+    exit 0
+    ;;
+  *)
+    sed -n '2,10p' "$0"; exit 64
+    ;;
+esac

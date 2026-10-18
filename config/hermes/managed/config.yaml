@@ -1,0 +1,56 @@
+# Managed policy for Hermes in the sandbox (HERMES_MANAGED_DIR).
+# Overrides ~/.hermes/config.yaml key by key and is read-only inside the
+# container - neither the agent nor "hermes config set" can change it.
+# Personal settings (model, display, ...) belong in config/hermes/config.yaml.
+
+terminal:
+  backend: local          # Hermes already runs inside the container
+  home_mode: real         # HOME=/home/dev so git/gh/glab/kubectl/mise see the real config
+  cwd: /workspace         # for gateway/cron; the CLI uses its start directory
+
+skills:
+  # Shared skills with Claude Code (same SKILL.md files)
+  external_dirs:
+    - /opt/sandbox/config/skills
+
+auth:
+  # Hermes must NOT adopt the Claude Code login (~/.claude/.credentials.json):
+  # rotating refresh tokens would invalidate each other.
+  adopt_external_logins: false
+
+# Shared command policy (the same one as the Claude Code PreToolUse hook)
+hooks_auto_accept: true
+hooks:
+  pre_tool_call:
+    - matcher: "terminal"
+      command: "/opt/sandbox/bin/sandbox-guard --hermes-hook"
+      timeout: 15
+      fail_closed: true
+
+approvals:
+  # Second line of defence: fnmatch patterns that stay blocked even with --yolo
+  deny:
+    - "*gh pr merge*"
+    - "*gh repo delete*"
+    - "*glab mr merge*"
+    - "*glab mr approve*"
+    - "*glab repo delete*"
+    - "*git push*--force *"
+    - "*git push* -f *"
+    - "*git push*--mirror*"
+    - "*sops -d *"
+    - "*sops --decrypt*"
+    - "*kubectl apply *"
+    - "*kubectl delete *"
+    - "*kubectl edit *"
+    - "*kubectl patch *"
+    - "*helm install *"
+    - "*helm upgrade *"
+    - "*helm uninstall *"
+    - "*flux reconcile *"
+    - "*talosctl reset*"
+    - "*talosctl apply-config*"
+
+delegation:
+  max_spawn_depth: 1            # reviewers are leaves, no sub-sub-agents
+  max_concurrent_children: 4    # code / security / k8s / iac in parallel

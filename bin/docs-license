@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# docs-license - print the official text of a license (never written by an LLM).
+#
+#   docs-license <spdx-key> [copyright-holder] [year]  > LICENSE
+#   docs-license --list
+#
+# Source: the GitHub licenses API (choosealicense.com texts). Only the [year] and
+# [fullname] placeholders are filled in (MIT, BSD, ...); license texts with an
+# appendix (e.g. Apache-2.0) stay verbatim, as GitHub's own license picker does.
+# Defaults: holder = $DOCS_COPYRIGHT_HOLDER or the git user.name, year = current year.
+set -euo pipefail
+
+API="${DOCS_LICENSE_API:-https://api.github.com/licenses}"
+fetch() {
+  local auth=()
+  [ -n "${GH_TOKEN:-}" ] && [[ "$API" == https://api.github.com* ]] && auth=(-H "Authorization: Bearer $GH_TOKEN")
+  curl -fsSL -H "Accept: application/vnd.github+json" "${auth[@]+"${auth[@]}"}" "$1"
+}
+
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,11p' "$0"; exit 64 ;;
+  --list) fetch "$API" | jq -r '.[] | "\(.key)\t\(.name)"'; exit 0 ;;
+esac
+
+key="$(tr '[:upper:]' '[:lower:]' <<<"$1")"
+holder="${2:-${DOCS_COPYRIGHT_HOLDER:-$(git config user.name 2>/dev/null || true)}}"
+year="${3:-$(date +%Y)}"
+
+json="$(fetch "$API/$key")" || { echo "docs-license: unknown license '$1' (see docs-license --list)" >&2; exit 1; }
+body="$(jq -r '.body // empty' <<<"$json")"
+[ -n "$body" ] || { echo "docs-license: no license text for '$1'" >&2; exit 1; }
+
+if grep -q '\[fullname\]' <<<"$body" && [ -z "$holder" ]; then
+  echo "docs-license: '$1' needs a copyright holder (argument 2 or DOCS_COPYRIGHT_HOLDER)" >&2; exit 1
+fi
+body="${body//\[year\]/$year}"
+body="${body//\[fullname\]/$holder}"
+printf '%s\n' "$body"

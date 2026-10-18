@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Shim in front of /usr/bin/gh: checks subcommand and flags against the sandbox policy.
+# Free-text values (title, body, -f fields) are removed before the check,
+# so a PR text that mentions e.g. "merge" is not blocked by mistake.
+args=()
+skip=0
+for a in "$@"; do
+  if [ $skip -eq 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -b|--body|-t|--title|-F|--body-file|-f|--field|--raw-field|-q|--jq|--template|-n|--notes|--search|-S)
+      skip=1 ;;
+    --body=*|--title=*|--field=*|--raw-field=*|--jq=*|--template=*|--notes=*|--search=*|--body-file=*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+sandbox-guard --check "gh ${args[*]}" "$PWD" || exit 2
+exec /usr/bin/gh "$@"

@@ -1,0 +1,64 @@
+name: "🤖 Agent task"
+description: "Task for Claude/Hermes - gets planned (/plan-item), approved and implemented (/implement-item)"
+title: "<area>: <what should happen>"
+labels: ["agent/todo"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Flow: **agent/todo** → plan on the issue (**agent/planned**) → approval (**agent/approved**) → PR (**agent/in-review**) → you merge.
+        The clearer the acceptance criteria, the better the result. Writing in German is fine - the agent rewrites the issue in English.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options: ["Feature", "Bug", "Maintenance / update", "Security", "Docs", "Research / spike"]
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: ["Kubernetes / GitOps", "Talos", "Ansible", "PowerShell", "Shell / Python script", "Website / frontend", "Backend / API", "CI/CD", "Other"]
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal / user story
+      description: "As a <role> I want <capability> so that <benefit>."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable criteria - how do you know it is done?
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context & notes
+      description: Affected apps/paths, links, logs, examples in the repo
+  - type: textarea
+    id: limits
+    attributes:
+      label: Boundaries
+      description: What must not be touched? Assumptions, maintenance window
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options: ["low", "medium", "high (publicly reachable, data, security)"]
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Preferred agent
+      description: For "ticket run" - add the label agent/claude or agent/hermes if it matters
+      options: ["any", "Claude Code", "Hermes"]

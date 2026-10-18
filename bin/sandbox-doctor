@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# sandbox-doctor - checks whether the sandbox is ready to use.
+set -uo pipefail
+
+ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✘\033[0m %s\n' "$*"; }
+
+echo "Tools"
+missing=()
+for t in git gh glab kubectl helm kustomize flux flux-local kubeconform kube-linter sops yq jq mise go node npm uv pwsh \
+         ansible ansible-lint yamllint shellcheck hadolint actionlint zizmor gitleaks trivy semgrep claude hermes; do
+  command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+done
+if [ ${#missing[@]} -eq 0 ]; then ok "all tools present"; else bad "missing: ${missing[*]}"; fi
+ok "claude $(claude --version 2>/dev/null | head -1)"
+ok "hermes $(hermes --version 2>/dev/null | head -1)"
+
+echo "Git"
+if [ -n "$(git config --global user.name)" ] && [ -n "$(git config --global user.email)" ]; then
+  ok "identity: $(git config --global user.name) <$(git config --global user.email)>"
+else
+  warn "set GIT_USER_NAME / GIT_USER_EMAIL in .env"
+fi
+
+# Repos from TICKET_REPOS / TICKET_DEFAULT_REPO, split by forge
+gh_repos=() gl_repos=()
+for r in ${TICKET_REPOS:-${TICKET_DEFAULT_REPO:-}}; do
+  r="${r#https://}"
+  case "$r" in
+    gl:*) gl_repos+=("${GITLAB_HOST:-gitlab.com}/${r#gl:}") ;;
+    github.com/*) gh_repos+=("${r#github.com/}") ;;
+    *.*/*/*) gl_repos+=("$r") ;;
+    */*) gh_repos+=("$r") ;;
+  esac
+done
+
+echo "GitHub"
+if [ -z "${GH_TOKEN:-}" ]; then
+  if [ ${#gh_repos[@]} -gt 0 ]; then bad "GH_TOKEN missing - GitHub tickets/PRs will not work"; else ok "not configured (no GitHub repos in TICKET_REPOS)"; fi
+elif login="$(/usr/bin/gh api user -q .login 2>/dev/null)"; then
+  ok "token valid (user: $login)"
+  for r in "${gh_repos[@]+"${gh_repos[@]}"}"; do
+    perm="$(/usr/bin/gh api "repos/$r" -q '.permissions | to_entries | map(select(.value)) | map(.key) | join(",")' 2>/dev/null)"
+    if [ -z "$perm" ]; then bad "$r: no access"; continue; fi
+    ok "$r: $perm"
+    case ",$perm," in *",admin,"*) warn "$r: token has ADMIN rights - rulesets may not apply to the agent (see README: bot account)";; esac
+    /usr/bin/gh label list -R "$r" --search agent/ --json name -q '.[].name' 2>/dev/null | grep -q '^agent/todo$' \
+      && ok "$r: agent/* labels present" || warn "$r: agent/* labels missing -> ticket labels -R $r"
+  done
+else
+  bad "GH_TOKEN invalid or expired"
+fi
+
+echo "GitLab"
+if [ -z "${GITLAB_TOKEN:-}" ]; then
+  if [ ${#gl_repos[@]} -gt 0 ]; then bad "GITLAB_TOKEN missing - GitLab tickets/MRs will not work"; else ok "not configured (no GitLab repos in TICKET_REPOS)"; fi
+else
+  host="${GITLAB_HOST:-gitlab.com}"; host="${host#https://}"
+  if user="$(/usr/local/bin/glab api --hostname "$host" user 2>/dev/null | jq -r .username)" && [ -n "$user" ] && [ "$user" != null ]; then
+    ok "token valid on $host (user: $user)"
+    for r in "${gl_repos[@]+"${gl_repos[@]}"}"; do
+      h="${r%%/*}"; p="${r#*/}"; enc="$(jq -rn --arg p "$p" '$p|@uri')"
+      lvl="$(/usr/local/bin/glab api --hostname "$h" "projects/$enc" 2>/dev/null \
+        | jq -r '[.permissions.project_access.access_level // 0, .permissions.group_access.access_level // 0] | max')"
+      case "$lvl" in
+        ''|0|null) bad "$r: no access" ;;
+        10|20) warn "$r: access level $lvl (Guest/Reporter) - Developer (30) is needed to push branches" ;;
+        30) ok "$r: Developer (30) - can push branches and open MRs, cannot merge into protected main" ;;
+        *) ok "$r: access level $lvl"; warn "$r: Maintainer/Owner can push/merge to protected branches - prefer a Developer bot token (see README)" ;;
+      esac
+    done
+  else
+    bad "GITLAB_TOKEN invalid or expired for $host"
+  fi
+fi
+
+echo "Agents"
+if [ -s "$CLAUDE_CONFIG_DIR/.credentials.json" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then ok "Claude Code logged in"; else warn "Claude Code: run 'claude' and /login"; fi
+[ -f /etc/claude-code/managed-settings.json ] && ok "Claude policy active (hook: sandbox-guard)" || bad "/etc/claude-code/managed-settings.json missing"
+ok "Claude skills: $(find "$CLAUDE_CONFIG_DIR/skills" -name SKILL.md 2>/dev/null | wc -l), subagents: $(ls "$CLAUDE_CONFIG_DIR/agents"/*.md 2>/dev/null | wc -l)"
+if grep -qE '^(OPENROUTER|ANTHROPIC|OPENAI)_API_KEY=.+' "$HERMES_HOME/.env" 2>/dev/null || [ -s "$HERMES_HOME/auth.json" ]; then
+  ok "Hermes: provider access configured ($(yq '.model.provider + " / " + .model.default' "$HERMES_HOME/config.yaml" 2>/dev/null))"
+else
+  warn "Hermes: no provider - set HERMES_*_API_KEY in .env or run 'hermes model'"
+fi
+[ -f "$HERMES_MANAGED_DIR/config.yaml" ] && ok "Hermes policy active ($HERMES_MANAGED_DIR)" || bad "Hermes policy missing"
+yq -e '.skills.external_dirs[] | select(. == "/opt/sandbox/config/skills")' "$HERMES_HOME/config.yaml" >/dev/null 2>&1 \
+  && ok "Hermes sees the shared skills" || bad "Hermes: skills.external_dirs missing in $HERMES_HOME/config.yaml"
+
+echo "Documentation"
+if lic="$(docs-license --list 2>/dev/null | wc -l)" && [ "$lic" -gt 0 ]; then ok "docs-license: $lic license texts available"; else warn "docs-license: GitHub licenses API not reachable"; fi
+if [ -n "${DOCS_LICENSE_DEFAULT:-}" ]; then ok "default license: $DOCS_LICENSE_DEFAULT (holder: ${DOCS_COPYRIGHT_HOLDER:-$(git config --global user.name)})"; else ok "no default license - /write-docs asks per repo (DOCS_LICENSE_DEFAULT)"; fi
+[ -f /opt/sandbox/templates/docs/README.md ] && ok "doc templates present" || bad "doc templates missing (/opt/sandbox/templates/docs)"
+
+echo "Guardrails"
+if sandbox-guard --check "git push origin main" 2>/dev/null; then bad "guard lets a push to main through"; else ok "push to main is blocked"; fi
+if sandbox-guard --check "gh pr merge 1" 2>/dev/null; then bad "guard lets gh pr merge through"; else ok "gh pr merge is blocked"; fi
+if sandbox-guard --check "glab mr merge 1" 2>/dev/null; then bad "guard lets glab mr merge through"; else ok "glab mr merge is blocked"; fi
+for b in git gh glab; do [ "$(command -v "$b")" = "/opt/sandbox/bin/shims/$b" ] && ok "$b shim active" || warn "$b shim not first in PATH"; done
+
+echo "Kubernetes (optional)"
+if [ -s "${KUBECONFIG:-/nonexistent}" ]; then
+  if kubectl auth can-i list pods -A >/dev/null 2>&1; then
+    ok "cluster read access ($(kubectl config current-context 2>/dev/null))"
+    if kubectl auth can-i create deployments -A >/dev/null 2>&1; then bad "kubeconfig can WRITE - use read-only only!"; else ok "no write access"; fi
+  else warn "kubeconfig present, but no access"; fi
+else
+  ok "no cluster access configured (scripts/k8s-readonly-access.sh)"
+fi

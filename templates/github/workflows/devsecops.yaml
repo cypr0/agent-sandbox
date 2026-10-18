@@ -1,0 +1,66 @@
+---
+# Server-side counterpart of the local devsecops-gate: the same scanners,
+# no matter whether an agent or a human opened the PR.
+# Actions are pinned to commit SHAs - Renovate keeps them up to date.
+name: "DevSecOps"
+
+on:
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  secrets:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git --no-banner --redact --log-opts="${BASE_SHA}..HEAD" .
+
+  iac:
+    # Report only (exit code 0): on the whole repo legacy findings would block every PR.
+    # Blocking and diff-aware checks happen in devsecops-gate in the sandbox.
+    name: IaC misconfig (trivy, report only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: trivy config
+        env:
+          TRIVY_VERSION: "0.76.0"
+        run: |
+          curl -fsSLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" | grep "Linux-64bit.tar.gz$" | sha256sum -c -
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" trivy
+          ./trivy config --exit-code 0 --severity HIGH,CRITICAL --skip-dirs .git . | tee -a "$GITHUB_STEP_SUMMARY"
+
+  actions:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor
+        run: pipx run zizmor==1.31.1 --offline --min-severity medium .github/workflows

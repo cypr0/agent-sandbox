@@ -1,0 +1,10 @@
+# Zugangsdaten
+.env
+secrets/*
+!secrets/.gitkeep
+
+# Projekte der Agents (eigene Git-Repos)
+workspace/*
+!workspace/.gitkeep
+
+.DS_Store
