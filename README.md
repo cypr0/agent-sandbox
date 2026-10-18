@@ -417,19 +417,46 @@ Writes always go through GitOps: agent → PR → you merge → Flux.
 ## Maintenance
 
 ```bash
-./sandbox.sh update        # rebuild, latest Claude Code version
-./sandbox.sh build         # rebuild (e.g. after changing the Dockerfile or HERMES_VERSION)
+./sandbox.sh build         # rebuild (e.g. after merging a Renovate PR)
+./sandbox.sh update        # rebuild with fresh base images (--pull)
 ./sandbox.sh status | logs | stop | down
 ./sandbox.sh reset-state   # delete logins, sessions, Hermes memory, caches (workspace stays)
 tests/test-sandbox-guard.sh && tests/test-ticket.sh && tests/test-docs.sh   # regression tests (bash >= 4, jq)
 ```
 
-- Tool versions are pinned as `ARG`s at the top of `docker/Dockerfile`. Project tools (`talosctl`,
-  `just`, `yamlfmt`, ...) come from each repo's `.mise.toml` (`mise install`).
+- Every tool version is pinned in `docker/Dockerfile` - see "Automatic version updates" below. Project
+  tools (`talosctl`, `just`, `yamlfmt`, ...) come from each repo's `.mise.toml` (`mise install`).
 - Hermes is taken from the official image `nousresearch/hermes-agent:<HERMES_VERSION>`: code is
   read-only under `/opt/hermes`, state lives in a volume. Like the official image, the sandbox uses
   Hermes' bundled Python 3.14 and Node 26 as `python3`/`node`.
 - State lives in Docker volumes: `claude-home`, `hermes-home`, `sandbox-cache`, `mise-data`, `go-home`.
+
+### Automatic version updates (Renovate)
+
+All versions the sandbox uses are pinned, and [Renovate](https://docs.renovatebot.com/) keeps them current
+with pull requests (`.renovaterc.json5`):
+
+| What | Where | How Renovate finds it |
+|---|---|---|
+| CLI tools (kubectl, Helm, Flux, trivy, gitleaks, glab, PowerShell, ...) | `ARG` lines in `docker/Dockerfile` | `# renovate: datasource=... depName=...` comment above each `ARG` |
+| Python tools (ansible-core, ansible-lint, semgrep, flux-local, zizmor, ...) | `ARG` lines | same, `datasource=pypi` |
+| PowerShell modules (PSScriptAnalyzer, Pester) | `ARG` lines | same, `datasource=nuget` on the PowerShell Gallery |
+| Go, Claude Code | `ARG` lines | `golang-version`, `npm` (`@anthropic-ai/claude-code`) |
+| Debian base image, uv, Hermes Agent | `FROM` lines | Dockerfile manager; Debian is pinned by digest |
+| Versions in the CI templates | `templates/github/workflows/`, `templates/gitlab/` | GitHub Actions manager, annotations, GitLab CI manager |
+
+Policy:
+- Updates arrive on weekends, as **one grouped PR** for all minor/patch/digest updates. Major updates and
+  Hermes Agent (it swaps the bundled Python/Node/Chromium) get their own PRs.
+- A release must be at least **3 days old** before it is proposed (supply-chain safety); Claude Code waits
+  **7 days**, which is close to its "stable" channel.
+- Nothing is merged automatically yet - there is no CI that builds the image. Check out the PR,
+  run `./sandbox.sh build`, then merge.
+- Each version `ARG` sits directly above the build step that uses it, so an update only rebuilds from there.
+
+To add a new tool: pin it as an `ARG` right before its `RUN` step and put a `# renovate:` comment above it
+(`datasource`, `depName`, optionally `versioning`, `extractVersion` and `registryUrl` - in that order).
+`CLAUDE_CODE_VERSION=latest` or `HERMES_VERSION=...` in `.env` override the pins for a test build.
 
 ## Layout
 

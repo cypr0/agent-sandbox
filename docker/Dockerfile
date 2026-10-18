@@ -3,6 +3,9 @@
 # Kubernetes/GitOps, Ansible, PowerShell, shell, Go, web, GitHub/GitLab and DevSecOps.
 # Builds for linux/arm64 (Apple Silicon) and linux/amd64.
 
+# Versions are pinned and kept up to date by Renovate (see .renovaterc.json5).
+# Each ARG sits right before the step that uses it, so an update only rebuilds from there.
+# (UV_VERSION and HERMES_VERSION are picked up by Renovate's Dockerfile manager via the FROM lines.)
 ARG UV_VERSION=0.13.1
 ARG HERMES_VERSION=v0.22.2
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
@@ -13,34 +16,13 @@ FROM nousresearch/hermes-agent:${HERMES_VERSION} AS hermes
 RUN rm -rf /opt/hermes/uv-cache \
  && ln -sfn "$(cat /etc/hermes/agent-browser-executable-path)" /opt/hermes/agent-browser-chrome
 
-FROM debian:trixie-slim
+FROM debian:13-slim
 
 ARG TARGETARCH
 ARG TZ=Europe/Berlin
 ARG USER_UID=1000
 ARG USER_GID=1000
 
-# ---- versions (pinned on purpose; to update: change the number + ./sandbox.sh build)
-ARG GO_VERSION=1.27.2
-ARG KUBECTL_VERSION=1.37.1
-ARG HELM_VERSION=4.3.1
-ARG KUSTOMIZE_VERSION=5.8.3
-ARG FLUX_VERSION=2.9.6
-ARG KUBECONFORM_VERSION=0.8.0
-ARG KUBE_LINTER_VERSION=0.8.3
-ARG SOPS_VERSION=3.13.3
-ARG YQ_VERSION=4.54.1
-ARG MISE_VERSION=2026.10.13
-ARG GITLEAKS_VERSION=8.30.1
-ARG TRIVY_VERSION=0.76.0
-ARG HADOLINT_VERSION=2.15.1
-ARG ACTIONLINT_VERSION=1.7.12
-ARG PWSH_VERSION=7.6.7
-ARG SEMGREP_VERSION=1.181.0
-ARG FLUX_LOCAL_VERSION=8.4.0
-ARG ZIZMOR_VERSION=1.31.1
-# agent harness: "latest"/"stable" or a fixed version
-ARG CLAUDE_CODE_VERSION=stable
 ARG EXTRA_APT_PACKAGES=
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -77,6 +59,8 @@ RUN mkdir -p /etc/apt/keyrings \
 
 # ------------------------------------------------------------ Go
 ENV PATH=/usr/local/go/bin:${PATH}
+# renovate: datasource=golang-version depName=go
+ARG GO_VERSION=1.27.2
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -xz -C /usr/local \
  && go version
 
@@ -88,6 +72,32 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_LINK_MODE=copy
 
 # ------------------------------------------------------------ Kubernetes / GitOps / security (binaries)
+# renovate: datasource=github-releases depName=kubernetes/kubernetes extractVersion=^v(?<version>.+)$
+ARG KUBECTL_VERSION=1.37.1
+# renovate: datasource=github-releases depName=helm/helm extractVersion=^v(?<version>.+)$
+ARG HELM_VERSION=4.3.1
+# renovate: datasource=github-releases depName=kubernetes-sigs/kustomize extractVersion=^kustomize/v(?<version>.+)$
+ARG KUSTOMIZE_VERSION=5.8.3
+# renovate: datasource=github-releases depName=fluxcd/flux2 extractVersion=^v(?<version>.+)$
+ARG FLUX_VERSION=2.9.6
+# renovate: datasource=github-releases depName=yannh/kubeconform extractVersion=^v(?<version>.+)$
+ARG KUBECONFORM_VERSION=0.8.0
+# renovate: datasource=github-releases depName=stackrox/kube-linter extractVersion=^v(?<version>.+)$
+ARG KUBE_LINTER_VERSION=0.8.3
+# renovate: datasource=github-releases depName=getsops/sops extractVersion=^v(?<version>.+)$
+ARG SOPS_VERSION=3.13.3
+# renovate: datasource=github-releases depName=mikefarah/yq extractVersion=^v(?<version>.+)$
+ARG YQ_VERSION=4.54.1
+# renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
+ARG MISE_VERSION=2026.10.13
+# renovate: datasource=github-releases depName=gitleaks/gitleaks extractVersion=^v(?<version>.+)$
+ARG GITLEAKS_VERSION=8.30.1
+# renovate: datasource=github-releases depName=aquasecurity/trivy extractVersion=^v(?<version>.+)$
+ARG TRIVY_VERSION=0.76.0
+# renovate: datasource=github-releases depName=hadolint/hadolint extractVersion=^v(?<version>.+)$
+ARG HADOLINT_VERSION=2.15.1
+# renovate: datasource=github-releases depName=rhysd/actionlint extractVersion=^v(?<version>.+)$
+ARG ACTIONLINT_VERSION=1.7.12
 RUN set -eux; \
     A="${TARGETARCH}"; \
     case "$A" in amd64) GL=x64; TV=64bit; HL=x86_64; KL=""; MS=x64;; arm64) GL=arm64; TV=ARM64; HL=arm64; KL=_arm64; MS=arm64;; esac; \
@@ -112,6 +122,14 @@ RUN set -eux; \
     kubectl version --client; helm version --short; flux --version; trivy --version | head -1
 
 # ------------------------------------------------------------ PowerShell + PSScriptAnalyzer + Pester
+# renovate: datasource=github-releases depName=PowerShell/PowerShell extractVersion=^v(?<version>.+)$
+ARG PWSH_VERSION=7.6.7
+# renovate: datasource=nuget depName=PSScriptAnalyzer registryUrl=https://www.powershellgallery.com/api/v2/
+ARG PSSCRIPTANALYZER_VERSION=1.25.0
+# renovate: datasource=nuget depName=Pester registryUrl=https://www.powershellgallery.com/api/v2/
+ARG PESTER_VERSION=6.2.0
+# The single-quoted pwsh command is PowerShell code ($_ is expanded by pwsh, not by the shell).
+# hadolint ignore=SC2016
 RUN set -eux; \
     case "${TARGETARCH}" in amd64) P=x64;; arm64) P=arm64;; esac; \
     apt-get update; \
@@ -122,18 +140,32 @@ RUN set -eux; \
     curl -fsSL "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/powershell-${PWSH_VERSION}-linux-${P}.tar.gz" | tar -xz -C /opt/microsoft/powershell/7; \
     chmod +x /opt/microsoft/powershell/7/pwsh; ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh; \
     POWERSHELL_TELEMETRY_OPTOUT=1 pwsh -NoLogo -NoProfile -Command \
-      "Set-PSRepository PSGallery -InstallationPolicy Trusted; Install-Module PSScriptAnalyzer,Pester -Scope AllUsers -Force -ErrorAction Stop"; \
-    pwsh -NoLogo -NoProfile -Command '(Get-Module -ListAvailable PSScriptAnalyzer,Pester).Name'
+      "Set-PSRepository PSGallery -InstallationPolicy Trusted; Install-Module PSScriptAnalyzer -RequiredVersion ${PSSCRIPTANALYZER_VERSION} -Scope AllUsers -Force -ErrorAction Stop; Install-Module Pester -RequiredVersion ${PESTER_VERSION} -Scope AllUsers -Force -SkipPublisherCheck -ErrorAction Stop"; \
+    pwsh -NoLogo -NoProfile -Command '(Get-Module -ListAvailable PSScriptAnalyzer,Pester | ForEach-Object { "$($_.Name) $($_.Version)" })'
 
 # ------------------------------------------------------------ Python-based tools (one venv each via uv)
+# renovate: datasource=pypi depName=ansible-core
+ARG ANSIBLE_CORE_VERSION=2.21.5
+# renovate: datasource=pypi depName=ansible-lint
+ARG ANSIBLE_LINT_VERSION=26.10.1
+# renovate: datasource=pypi depName=yamllint
+ARG YAMLLINT_VERSION=1.38.0
+# renovate: datasource=pypi depName=semgrep
+ARG SEMGREP_VERSION=1.181.0
+# renovate: datasource=pypi depName=flux-local
+ARG FLUX_LOCAL_VERSION=8.4.0
+# renovate: datasource=pypi depName=zizmor
+ARG ZIZMOR_VERSION=1.31.1
+# renovate: datasource=pypi depName=pre-commit
+ARG PRE_COMMIT_VERSION=4.7.0
 RUN set -eux; \
-    uv tool install "ansible-core"; \
-    uv tool install "ansible-lint"; \
-    uv tool install "yamllint"; \
+    uv tool install "ansible-core==${ANSIBLE_CORE_VERSION}"; \
+    uv tool install "ansible-lint==${ANSIBLE_LINT_VERSION}"; \
+    uv tool install "yamllint==${YAMLLINT_VERSION}"; \
     uv tool install "semgrep==${SEMGREP_VERSION}"; \
     uv tool install "flux-local==${FLUX_LOCAL_VERSION}"; \
     uv tool install "zizmor==${ZIZMOR_VERSION}"; \
-    uv tool install "pre-commit"; \
+    uv tool install "pre-commit==${PRE_COMMIT_VERSION}"; \
     chmod -R a+rX /opt/uv; \
     ansible --version | head -1; ansible-lint --version | head -1; semgrep --version; flux-local --help >/dev/null
 
@@ -165,6 +197,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && python3 --version && node --version && npm --version && HERMES_HOME=/tmp/hermes-build hermes --version && rm -rf /tmp/hermes-build
 
 # ------------------------------------------------------------ GitLab CLI (glab)
+# renovate: datasource=gitlab-releases depName=gitlab-org/cli extractVersion=^v(?<version>.+)$
 ARG GLAB_VERSION=1.123.0
 RUN set -eux; \
     base="https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/packages/generic/glab/${GLAB_VERSION}"; \
@@ -204,6 +237,10 @@ ENV HOME=/home/dev \
     PATH=/opt/sandbox/bin/shims:/opt/sandbox/bin:/home/dev/.local/bin:/home/dev/.npm-global/bin:/home/dev/go/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/home/dev/.local/share/mise/shims
 
 # ------------------------------------------------------------ Claude Code (native installer, as dev)
+# Pinned for reproducible builds; Renovate proposes new versions after a 7-day soak
+# (similar to the "stable" channel). Override with CLAUDE_CODE_VERSION=latest|stable in .env.
+# renovate: datasource=npm depName=@anthropic-ai/claude-code
+ARG CLAUDE_CODE_VERSION=2.1.292
 ARG CACHE_BUST_AGENTS=0
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}" \
  && /home/dev/.local/bin/claude --version
