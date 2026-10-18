@@ -36,6 +36,8 @@ of the [README](README.md) for details. In short:
 - The effective protection of repositories comes from tokens with minimal permissions and from branch
   protection on GitHub/GitLab; cluster access is optional and read-only.
 - The repository contains no secrets: `.env`, `secrets/` and `workspace/` are excluded via `.gitignore`.
+- Every tool version in the image is pinned (the Debian base image by digest) and updated through reviewed Renovate
+  pull requests; new releases are only proposed after a minimum age of 3 days.
 
 ## Scope
 

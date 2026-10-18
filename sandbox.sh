@@ -8,7 +8,7 @@
 #   ./sandbox.sh gate [args]     devsecops-gate in the container
 #   ./sandbox.sh doctor          check the setup
 #   ./sandbox.sh build           rebuild the image
-#   ./sandbox.sh update          rebuild incl. the latest Claude Code version
+#   ./sandbox.sh update          rebuild with fresh base images (versions come from Renovate PRs)
 #   ./sandbox.sh status|logs|stop|down
 #   ./sandbox.sh reset-state     delete logins/sessions/caches (volumes) - asks first
 set -euo pipefail

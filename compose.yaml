@@ -8,8 +8,10 @@ services:
         TZ: ${TZ:-Europe/Berlin}
         USER_UID: ${SANDBOX_UID:-1000}
         USER_GID: ${SANDBOX_GID:-1000}
-        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-stable}
-        HERMES_VERSION: ${HERMES_VERSION:-v0.22.2}
+        # Versions are pinned in docker/Dockerfile (updated by Renovate). These two are only
+        # passed when set in .env, e.g. CLAUDE_CODE_VERSION=latest to try the newest release.
+        CLAUDE_CODE_VERSION:
+        HERMES_VERSION:
         CACHE_BUST_AGENTS: ${CACHE_BUST_AGENTS:-0}
         EXTRA_APT_PACKAGES: ${EXTRA_APT_PACKAGES:-}
     image: ${SANDBOX_IMAGE:-agent-sandbox:local}
